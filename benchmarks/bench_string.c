@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -15,6 +16,8 @@
 #define TRIALS 6
 #define IO_ITERATIONS 2000U
 #define CLOSE_ITERATIONS 128U
+#define STREAM_WRITE_ITERATIONS 8192U
+#define FORMATTED_IO_ITERATIONS 20000U
 
 extern void *iris_memcpy(void *restrict destination, const void *restrict source, size_t count);
 extern void *iris_memmove(void *destination, const void *source, size_t count);
@@ -26,6 +29,14 @@ extern int iris_strncmp(const char *left, const char *right, size_t count);
 extern ssize_t iris_read(int file_descriptor, void *buffer, size_t count);
 extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
 extern int iris_close(int file_descriptor);
+extern int iris_snprintf(char *buffer, size_t size, const char *format, ...);
+typedef struct iris_FILE iris_FILE;
+extern iris_FILE *iris_fopen(const char *path, const char *mode);
+extern int iris_fclose(iris_FILE *stream);
+extern int iris_fflush(iris_FILE *stream);
+extern int iris_fputc(int character, iris_FILE *stream);
+extern int iris_fprintf(iris_FILE *stream, const char *format, ...);
+extern int iris_vfprintf(iris_FILE *stream, const char *format, va_list arguments);
 
 typedef void *(*copy_function)(void *, const void *, size_t);
 typedef void *(*move_function)(void *, const void *, size_t);
@@ -37,6 +48,7 @@ typedef int (*string_ncompare_function)(const char *, const char *, size_t);
 typedef ssize_t (*read_function)(int, void *, size_t);
 typedef ssize_t (*write_function)(int, const void *, size_t);
 typedef int (*close_function)(int);
+typedef int (*snprintf_function)(char *, size_t, const char *, ...);
 typedef union {
     copy_function copy;
     move_function move;
@@ -45,6 +57,7 @@ typedef union {
     length_function length;
     string_compare_function string_compare;
     string_ncompare_function string_ncompare;
+    snprintf_function format;
 } benchmark_function;
 
 typedef union {
@@ -55,6 +68,8 @@ typedef union {
 
 typedef double (*io_timer_function)(size_t, size_t, io_benchmark_function, int);
 
+static double median(double samples[TRIALS]);
+
 static unsigned char source_data[MAX_SIZE];
 static unsigned char destination_data[MAX_SIZE + 1];
 static unsigned char compare_data[MAX_SIZE];
@@ -62,6 +77,8 @@ static char left_text[MAX_SIZE + 1];
 static char right_text[MAX_SIZE + 1];
 static volatile size_t benchmark_sink;
 static unsigned char io_buffer[4096];
+static char format_buffer[256];
+static char format_text[128];
 
 static double elapsed_nanoseconds(struct timespec start, struct timespec end)
 {
@@ -214,6 +231,25 @@ static double time_string_ncompare(size_t size, size_t iterations, benchmark_fun
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
+static double time_format(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    snprintf_function function = opaque_function.format;
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    format_text[size] = '\0';
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(format_buffer, sizeof(format_buffer), "%s:%08d:%#x",
+            format_text, 1234567, 0xabcdeU);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result + (unsigned char)format_buffer[0];
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
 static double time_read(size_t size, size_t iterations,
     io_benchmark_function opaque_function, int file_descriptor)
 {
@@ -279,9 +315,119 @@ static double time_close(size_t size, size_t iterations,
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
-static double median(double samples[TRIALS]);
+static double time_direct_byte_write(size_t iterations, int file_descriptor,
+    write_function function)
+{
+    static const char byte = 'x';
+    struct timespec start;
+    struct timespec end;
 
-static double median(double samples[TRIALS]);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        benchmark_sink += (size_t)function(file_descriptor, &byte, 1);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_buffered_fputc(size_t iterations, iris_FILE *stream)
+{
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        benchmark_sink += (size_t)(iris_fputc('x', stream) + 1);
+    }
+    iris_fflush(stream);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static int host_vfprintf_call(FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int iris_vfprintf_call(iris_FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = iris_vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static double time_host_formatted_output(size_t iterations, FILE *stream,
+    int use_vfprintf)
+{
+    static const char *text = "iris";
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = use_vfprintf
+            ? host_vfprintf_call(stream, "%s:%08d:%#x", text, 1234567, 0xabcdeU)
+            : fprintf(stream, "%s:%08d:%#x", text, 1234567, 0xabcdeU);
+    }
+    fflush(stream);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_iris_formatted_output(size_t iterations, iris_FILE *stream,
+    int use_vfprintf)
+{
+    static const char *text = "iris";
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = use_vfprintf
+            ? iris_vfprintf_call(stream, "%s:%08d:%#x", text, 1234567, 0xabcdeU)
+            : iris_fprintf(stream, "%s:%08d:%#x", text, 1234567, 0xabcdeU);
+    }
+    iris_fflush(stream);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static void report_formatted_stream(const char *label, FILE *host_stream,
+    iris_FILE *iris_stream, int use_vfprintf)
+{
+    double host_samples[TRIALS];
+    double iris_samples[TRIALS];
+
+    for (size_t trial = 0; trial < TRIALS; trial++) {
+        if ((trial & 1U) == 0) {
+            host_samples[trial] = time_host_formatted_output(
+                FORMATTED_IO_ITERATIONS, host_stream, use_vfprintf);
+            iris_samples[trial] = time_iris_formatted_output(
+                FORMATTED_IO_ITERATIONS, iris_stream, use_vfprintf);
+        } else {
+            iris_samples[trial] = time_iris_formatted_output(
+                FORMATTED_IO_ITERATIONS, iris_stream, use_vfprintf);
+            host_samples[trial] = time_host_formatted_output(
+                FORMATTED_IO_ITERATIONS, host_stream, use_vfprintf);
+        }
+    }
+
+    double host_median = median(host_samples);
+    double iris_median = median(iris_samples);
+    printf("| %-8s | %16.2f | %16.2f | %15.2fx |\n", label,
+        host_median, iris_median,
+        iris_median > 0.0 ? host_median / iris_median : 0.0);
+}
 
 static void report_io(const char *label, size_t size, size_t iterations,
     io_timer_function timer, io_benchmark_function system_function,
@@ -359,6 +505,26 @@ int main(void)
         right_text[index] = left_text[index];
     }
 
+    for (size_t index = 0; index < sizeof(format_text) - 1; index++) {
+        format_text[index] = (char)('a' + index % 26U);
+    }
+
+    char host_format_result[256];
+    char iris_format_result[256];
+    const size_t format_sizes[] = { 8, 32, 96 };
+    for (size_t index = 0; index < sizeof(format_sizes) / sizeof(format_sizes[0]); index++) {
+        size_t size = format_sizes[index];
+        format_text[size] = '\0';
+        int host_length = snprintf(host_format_result, sizeof(host_format_result),
+            "%s:%08d:%#x", format_text, 1234567, 0xabcdeU);
+        int iris_length = iris_snprintf(iris_format_result, sizeof(iris_format_result),
+            "%s:%08d:%#x", format_text, 1234567, 0xabcdeU);
+        if (host_length != iris_length || strcmp(host_format_result, iris_format_result) != 0) {
+            fprintf(stderr, "snprintf output mismatch at text size %zu\n", size);
+            return 1;
+        }
+    }
+
     printf("Iris libc vs %s; median of %d trials\n", BENCH_LIBC_NAME, TRIALS);
     puts("+----------+----------+------------------+------------------+------------------+");
     printf("| %-8s | %8s | %-16s | %-16s | %-16s |\n",
@@ -377,6 +543,76 @@ int main(void)
         REPORT(strcmp, size, iterations, time_string_compare, string_compare, strcmp, iris_strcmp);
         REPORT(strncmp, size, iterations, time_string_ncompare, string_ncompare, strncmp, iris_strncmp);
     }
+
+    puts("snprintf formatting vs libc; median of 6 trials");
+    puts("+----------+----------+------------------+------------------+------------------+");
+    printf("| %-8s | %8s | %-16s | %-16s | %-16s |\n",
+        "Function", "Text (B)", "libc ns/op", "Iris ns/op", "speedup");
+    puts("+----------+----------+------------------+------------------+------------------+");
+    for (size_t index = 0; index < sizeof(format_sizes) / sizeof(format_sizes[0]); index++) {
+        size_t size = format_sizes[index];
+        REPORT(snprintf, size, 50000, time_format, format, snprintf, iris_snprintf);
+    }
+    puts("+----------+----------+------------------+------------------+------------------+");
+
+    FILE *host_formatted_stream = fopen("/dev/null", "w");
+    iris_FILE *iris_formatted_stream = iris_fopen("/dev/null", "w");
+    if (host_formatted_stream == NULL || iris_formatted_stream == NULL) {
+        perror("open formatted output benchmark stream");
+        if (host_formatted_stream != NULL) fclose(host_formatted_stream);
+        if (iris_formatted_stream != NULL) iris_fclose(iris_formatted_stream);
+        return 1;
+    }
+    puts("fprintf/vfprintf stream formatting vs libc; median of 6 trials");
+    puts("+----------+------------------+------------------+------------------+");
+    printf("| %-8s | %-16s | %-16s | %-16s |\n",
+        "Function", "libc ns/op", "Iris ns/op", "speedup");
+    puts("+----------+------------------+------------------+------------------+");
+    report_formatted_stream("fprintf", host_formatted_stream,
+        iris_formatted_stream, 0);
+    report_formatted_stream("vfprintf", host_formatted_stream,
+        iris_formatted_stream, 1);
+    puts("+----------+------------------+------------------+------------------+");
+    fclose(host_formatted_stream);
+    iris_fclose(iris_formatted_stream);
+
+    int direct_write_descriptor = open("/dev/null", O_WRONLY);
+    iris_FILE *buffered_stream = iris_fopen("/dev/null", "w");
+    if (direct_write_descriptor < 0 || buffered_stream == NULL) {
+        perror("open stdio benchmark device");
+        if (direct_write_descriptor >= 0) close(direct_write_descriptor);
+        if (buffered_stream != NULL) iris_fclose(buffered_stream);
+        return 1;
+    }
+
+    double direct_samples[TRIALS];
+    double buffered_samples[TRIALS];
+    for (size_t trial = 0; trial < TRIALS; trial++) {
+        if ((trial & 1U) == 0) {
+            direct_samples[trial] = time_direct_byte_write(STREAM_WRITE_ITERATIONS,
+                direct_write_descriptor, write);
+            buffered_samples[trial] = time_buffered_fputc(STREAM_WRITE_ITERATIONS,
+                buffered_stream);
+        } else {
+            buffered_samples[trial] = time_buffered_fputc(STREAM_WRITE_ITERATIONS,
+                buffered_stream);
+            direct_samples[trial] = time_direct_byte_write(STREAM_WRITE_ITERATIONS,
+                direct_write_descriptor, write);
+        }
+    }
+    double direct_median = median(direct_samples);
+    double buffered_median = median(buffered_samples);
+    printf("Buffered FILE output vs one-byte write calls (%u bytes)\n",
+        STREAM_WRITE_ITERATIONS);
+    puts("+------------------+------------------+------------------+");
+    printf("| %-16s | %-16s | %-16s |\n", "write ns/byte",
+        "fputc ns/byte", "speedup");
+    puts("+------------------+------------------+------------------+");
+    printf("| %16.2f | %16.2f | %15.2fx |\n", direct_median,
+        buffered_median, buffered_median > 0.0 ? direct_median / buffered_median : 0.0);
+    puts("+------------------+------------------+------------------+");
+    iris_fclose(buffered_stream);
+    close(direct_write_descriptor);
 
     puts("+----------+----------+------------------+------------------+------------------+");
 

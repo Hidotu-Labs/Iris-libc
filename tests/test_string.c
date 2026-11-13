@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 extern int getpagesize(void);
+extern int unlink(const char *path);
 
 static int check_word_paths(void)
 {
@@ -250,38 +251,274 @@ static int check_page_edge_strings(void)
 
 static int check_unistd(void)
 {
-    FILE *stream = tmpfile();
-    if (stream == NULL) {
+    unsigned char actual[4];
+    int file_descriptor = open("/dev/zero", O_RDONLY);
+    if (file_descriptor < 0 || read(file_descriptor, actual, sizeof(actual)) != (ssize_t)sizeof(actual)) {
+        if (file_descriptor >= 0) close(file_descriptor);
         return 1;
     }
-
-    const char expected[] = "iris";
-    char actual[sizeof(expected)];
-    int file_descriptor = fileno(stream);
-    if (write(file_descriptor, expected, sizeof(expected)) != (ssize_t)sizeof(expected)) {
-        fclose(stream);
-        return 2;
+    for (size_t index = 0; index < sizeof(actual); index++) {
+        if (actual[index] != 0) {
+            close(file_descriptor);
+            return 2;
+        }
     }
-    if (fseek(stream, 0, SEEK_SET) != 0 ||
-        read(file_descriptor, actual, sizeof(actual)) != (ssize_t)sizeof(actual) ||
-        memcmp(actual, expected, sizeof(expected)) != 0) {
-        fclose(stream);
+    if (close(file_descriptor) != 0) {
         return 3;
     }
-    if (fclose(stream) != 0) {
+
+    file_descriptor = open("/dev/null", O_WRONLY);
+    const char expected[] = "iris";
+    if (file_descriptor < 0 || write(file_descriptor, expected, sizeof(expected)) != (ssize_t)sizeof(expected)) {
+        if (file_descriptor >= 0) close(file_descriptor);
         return 4;
+    }
+    if (close(file_descriptor) != 0) {
+        return 5;
     }
 
     file_descriptor = open("/dev/null", O_RDONLY);
     if (file_descriptor < 0 || close(file_descriptor) != 0) {
-        return 5;
+        return 6;
     }
 
     errno = 0;
     if (read(-1, actual, sizeof(actual)) != -1 || errno != EBADF) {
+        return 7;
+    }
+
+    return 0;
+}
+
+static int format_variadic(char *buffer, size_t size, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vsnprintf(buffer, size, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int print_variadic(const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vprintf(format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int print_stream_variadic(FILE *stream, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int check_stdio(void)
+{
+    char buffer[64];
+    if (stdin == NULL || stdout == NULL || stderr == NULL) {
+        return 12;
+    }
+    int length = snprintf(buffer, sizeof(buffer), "[%#08x] %s %d", 42U, "iris", -17);
+    if (length != 19 || strcmp(buffer, "[0x00002a] iris -17") != 0) {
+        return 1;
+    }
+    length = snprintf(buffer, 8, "%.3s %05d", "iridium", 42);
+    if (length != 9 || strcmp(buffer, "iri 000") != 0) {
+        return 2;
+    }
+    if (snprintf(NULL, 0, "%s:%u", "ok", 7U) != 4) {
+        return 3;
+    }
+    if (snprintf(buffer, sizeof(buffer), "%+06d %#o %#.0o", -42, 8U, 0U) != 12 ||
+        strcmp(buffer, "-00042 010 0") != 0) {
+        return 4;
+    }
+    if (snprintf(buffer, sizeof(buffer), "%s", "abcdef") != 6 || buffer[6] != '\0') {
+        return 5;
+    }
+    if (snprintf(buffer, 4, "%s", "abcdef") != 6 || strcmp(buffer, "abc") != 0) {
+        return 8;
+    }
+    if (snprintf(buffer, sizeof(buffer), "%.0s", "abcdef") != 0 || buffer[0] != '\0') {
+        return 9;
+    }
+    errno = 0;
+    if (snprintf(buffer, sizeof(buffer), "1%2147483647s", "x") != -1 ||
+        errno != EOVERFLOW || buffer[sizeof(buffer) - 1] != '\0') {
+        return 10;
+    }
+    if (format_variadic(buffer, sizeof(buffer), "%s-%d", "ok", 7) != 4 ||
+        strcmp(buffer, "ok-7") != 0) {
+        return 6;
+    }
+    if (printf("%s", "") != 0 || printf("printf: %d\n", 7) != 10 ||
+        print_variadic("vprintf: %d\n", 7) != 11 || fprintf(stderr, "") != 0) {
+        return 7;
+    }
+    if (fflush(NULL) != 0) {
+        return 11;
+    }
+    return 0;
+}
+
+static int check_file_streams(void)
+{
+    const char *path = "/tmp/iris-libc-stdio-test";
+    const char original[] = "abcde";
+    const char expected[] = "abcXe-7:ok";
+    char actual[sizeof(expected)];
+    unlink(path);
+
+    FILE *stream = fopen(path, "w");
+    if (stream == NULL) {
+        unlink(path);
+        return 1;
+    }
+    if (fwrite(original, 1, sizeof(original) - 1, stream) !=
+        sizeof(original) - 1 || fprintf(stream, "-%d", 7) != 2 ||
+        print_stream_variadic(stream, ":%s", "ok") != 3 || fflush(stream) != 0) {
+        fclose(stream);
+        unlink(path);
+        return 1;
+    }
+    if (fclose(stream) != 0) {
+        unlink(path);
+        return 1;
+    }
+
+    stream = fopen(path, "r+");
+    if (stream == NULL) {
+        unlink(path);
+        return 2;
+    }
+    if (fread(actual, 1, 3, stream) != 3 || actual[0] != 'a' || actual[1] != 'b' ||
+        actual[2] != 'c') {
+        fclose(stream);
+        unlink(path);
+        return 3;
+    }
+    if (fputc('X', stream) != 'X' || fclose(stream) != 0) {
+        unlink(path);
+        return 4;
+    }
+
+    stream = fopen(path, "rb+");
+    if (stream == NULL || fread(actual, 1, 3, stream) != 3 ||
+        memcmp(actual, "abc", 3) != 0 ||
+        fgetc(stream) != 'X' || fgetc(stream) != 'e' ||
+        fgetc(stream) != '-' || fgetc(stream) != '7' ||
+        fgetc(stream) != ':' || fgetc(stream) != 'o' || fgetc(stream) != 'k' ||
+        fgetc(stream) != EOF || !feof(stream) || ferror(stream)) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 5;
+    }
+    clearerr(stream);
+    if (feof(stream) || ferror(stream)) {
+        fclose(stream);
+        unlink(path);
+        return 12;
+    }
+    if (fgetc(stream) != EOF || !feof(stream)) {
+        fclose(stream);
+        unlink(path);
+        return 13;
+    }
+    if (fclose(stream) != 0 || unlink(path) != 0) {
         return 6;
     }
 
+    stream = fopen("/dev/full", "w");
+    if (stream == NULL || fwrite("x", 1, 1, stream) != 1 ||
+        fflush(stream) != EOF || !ferror(stream)) {
+        if (stream != NULL) fclose(stream);
+        return 14;
+    }
+    if (fprintf(stream, "%s", "y") != -1 || !ferror(stream)) {
+        fclose(stream);
+        return 16;
+    }
+    clearerr(stream);
+    if (ferror(stream) || fclose(stream) != EOF) {
+        return 15;
+    }
+
+    errno = 0;
+    if (fopen(path, "invalid") != NULL || errno != EINVAL) {
+        unlink(path);
+        return 7;
+    }
+    return 0;
+}
+
+static int check_bulk_file_streams(void)
+{
+    const char *path = "/tmp/iris-libc-stdio-bulk-test";
+    const size_t length = 2 * BUFSIZ + 37;
+    unsigned char source[2 * BUFSIZ + 37];
+    unsigned char actual[2 * BUFSIZ + 42];
+    char formatted[BUFSIZ + 1];
+    unlink(path);
+
+    for (size_t index = 0; index < length; index++) {
+        source[index] = (unsigned char)(index * 29U + 11U);
+    }
+    memset(formatted, 'f', BUFSIZ);
+    formatted[BUFSIZ] = '\0';
+    FILE *formatted_stream = fopen(path, "w");
+    if (formatted_stream == NULL ||
+        fprintf(formatted_stream, "%s", formatted) != BUFSIZ ||
+        fflush(formatted_stream) != 0 || fclose(formatted_stream) != 0) {
+        if (formatted_stream != NULL) fclose(formatted_stream);
+        unlink(path);
+        return 8;
+    }
+    formatted_stream = fopen(path, "r");
+    if (formatted_stream == NULL ||
+        fread(actual, 1, BUFSIZ, formatted_stream) != BUFSIZ ||
+        memcmp(actual, formatted, BUFSIZ) != 0 ||
+        fgetc(formatted_stream) != EOF || fclose(formatted_stream) != 0) {
+        if (formatted_stream != NULL) fclose(formatted_stream);
+        unlink(path);
+        return 9;
+    }
+
+    FILE *stream = fopen(path, "w");
+    if (stream == NULL) return 1;
+    if (fputc(source[0], stream) != source[0] ||
+        fwrite(source + 1, 1, length - 1, stream) != length - 1) {
+        fclose(stream);
+        unlink(path);
+        return 2;
+    }
+    if (fclose(stream) != 0) {
+        unlink(path);
+        return 3;
+    }
+
+    stream = fopen(path, "r");
+    if (stream == NULL) {
+        unlink(path);
+        return 4;
+    }
+    if (fgetc(stream) != source[0] ||
+        fread(actual + 1, 3, (length + 4) / 3, stream) != (length - 1) / 3 ||
+        !feof(stream) || ferror(stream) ||
+        memcmp(actual + 1, source + 1, length - 1) != 0) {
+        fclose(stream);
+        unlink(path);
+        return 5;
+    }
+    if (fclose(stream) != 0) {
+        unlink(path);
+        return 6;
+    }
+    if (unlink(path) != 0) return 7;
     return 0;
 }
 
@@ -333,6 +570,18 @@ int main(void)
     int unistd_result = check_unistd();
     if (unistd_result != 0) {
         return 40 + unistd_result;
+    }
+    int stdio_result = check_stdio();
+    if (stdio_result != 0) {
+        return 50 + stdio_result;
+    }
+    int file_stream_result = check_file_streams();
+    if (file_stream_result != 0) {
+        return 60 + file_stream_result;
+    }
+    int bulk_stream_result = check_bulk_file_streams();
+    if (bulk_stream_result != 0) {
+        return 80 + bulk_stream_result;
     }
 
     return 0;
