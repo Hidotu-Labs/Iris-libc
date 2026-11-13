@@ -1,0 +1,417 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef BENCH_LIBC_NAME
+#define BENCH_LIBC_NAME "host libc"
+#endif
+
+#define MAX_SIZE (1024U * 1024U)
+#define TARGET_BYTES (16U * 1024U * 1024U)
+#define TRIALS 6
+#define IO_ITERATIONS 2000U
+#define CLOSE_ITERATIONS 128U
+
+extern void *iris_memcpy(void *restrict destination, const void *restrict source, size_t count);
+extern void *iris_memmove(void *destination, const void *source, size_t count);
+extern void *iris_memset(void *destination, int value, size_t count);
+extern int iris_memcmp(const void *left, const void *right, size_t count);
+extern size_t iris_strlen(const char *string);
+extern int iris_strcmp(const char *left, const char *right);
+extern int iris_strncmp(const char *left, const char *right, size_t count);
+extern ssize_t iris_read(int file_descriptor, void *buffer, size_t count);
+extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
+extern int iris_close(int file_descriptor);
+
+typedef void *(*copy_function)(void *, const void *, size_t);
+typedef void *(*move_function)(void *, const void *, size_t);
+typedef void *(*set_function)(void *, int, size_t);
+typedef int (*memory_compare_function)(const void *, const void *, size_t);
+typedef size_t (*length_function)(const char *);
+typedef int (*string_compare_function)(const char *, const char *);
+typedef int (*string_ncompare_function)(const char *, const char *, size_t);
+typedef ssize_t (*read_function)(int, void *, size_t);
+typedef ssize_t (*write_function)(int, const void *, size_t);
+typedef int (*close_function)(int);
+typedef union {
+    copy_function copy;
+    move_function move;
+    set_function set;
+    memory_compare_function memory_compare;
+    length_function length;
+    string_compare_function string_compare;
+    string_ncompare_function string_ncompare;
+} benchmark_function;
+
+typedef union {
+    read_function read;
+    write_function write;
+    close_function close;
+} io_benchmark_function;
+
+typedef double (*io_timer_function)(size_t, size_t, io_benchmark_function, int);
+
+static unsigned char source_data[MAX_SIZE];
+static unsigned char destination_data[MAX_SIZE + 1];
+static unsigned char compare_data[MAX_SIZE];
+static char left_text[MAX_SIZE + 1];
+static char right_text[MAX_SIZE + 1];
+static volatile size_t benchmark_sink;
+static unsigned char io_buffer[4096];
+
+static double elapsed_nanoseconds(struct timespec start, struct timespec end)
+{
+    double seconds = (double)(end.tv_sec - start.tv_sec);
+    double nanoseconds = (double)(end.tv_nsec - start.tv_nsec);
+
+    return seconds * 1000000000.0 + nanoseconds;
+}
+
+static size_t iterations_for(size_t size)
+{
+    size_t iterations = TARGET_BYTES / size;
+
+    return iterations < 8 ? 8 : iterations;
+}
+
+static void prepare_text(size_t size)
+{
+    for (size_t index = 0; index < size; index++) {
+        char value = (char)('a' + index % 26U);
+        left_text[index] = value;
+        right_text[index] = value;
+    }
+    left_text[size] = '\0';
+    right_text[size] = '\0';
+}
+
+static double time_copy(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    copy_function function = opaque_function.copy;
+    struct timespec start;
+    struct timespec end;
+    void *result = NULL;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(destination_data, source_data, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += ((unsigned char *)result)[size - 1];
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_move(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    move_function function = opaque_function.move;
+    struct timespec start;
+    struct timespec end;
+    void *result = NULL;
+
+    for (size_t index = 0; index <= size; index++) {
+        destination_data[index] = (unsigned char)index;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(destination_data + 1, destination_data, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += ((unsigned char *)result)[size - 1];
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_set(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    set_function function = opaque_function.set;
+    struct timespec start;
+    struct timespec end;
+    void *result = NULL;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(destination_data, 0x5a, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += ((unsigned char *)result)[size - 1];
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_memory_compare(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    memory_compare_function function = opaque_function.memory_compare;
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(source_data, compare_data, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_length(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    length_function function = opaque_function.length;
+    struct timespec start;
+    struct timespec end;
+    size_t result = 0;
+
+    prepare_text(size);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(left_text);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result;
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_string_compare(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    string_compare_function function = opaque_function.string_compare;
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    prepare_text(size);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(left_text, right_text);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_string_ncompare(size_t size, size_t iterations, benchmark_function opaque_function)
+{
+    string_ncompare_function function = opaque_function.string_ncompare;
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    prepare_text(size);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(left_text, right_text, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_read(size_t size, size_t iterations,
+    io_benchmark_function opaque_function, int file_descriptor)
+{
+    read_function function = opaque_function.read;
+    struct timespec start;
+    struct timespec end;
+    ssize_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(file_descriptor, io_buffer, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_write(size_t size, size_t iterations,
+    io_benchmark_function opaque_function, int file_descriptor)
+{
+    write_function function = opaque_function.write;
+    struct timespec start;
+    struct timespec end;
+    ssize_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(file_descriptor, io_buffer, size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_close(size_t size, size_t iterations,
+    io_benchmark_function opaque_function, int unused_file_descriptor)
+{
+    close_function function = opaque_function.close;
+    int file_descriptors[CLOSE_ITERATIONS];
+    struct timespec start;
+    struct timespec end;
+
+    (void)size;
+    (void)unused_file_descriptor;
+    for (size_t index = 0; index < iterations; index++) {
+        file_descriptors[index] = open("/dev/null", O_RDONLY);
+        if (file_descriptors[index] < 0) {
+            for (size_t opened = 0; opened < index; opened++) {
+                close(file_descriptors[opened]);
+            }
+            return 0.0;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        benchmark_sink += (size_t)(function(file_descriptors[index]) + 1);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double median(double samples[TRIALS]);
+
+static double median(double samples[TRIALS]);
+
+static void report_io(const char *label, size_t size, size_t iterations,
+    io_timer_function timer, io_benchmark_function system_function,
+    io_benchmark_function iris_function, int file_descriptor)
+{
+    double system_samples[TRIALS];
+    double iris_samples[TRIALS];
+
+    for (size_t trial = 0; trial < TRIALS; trial++) {
+        if ((trial & 1U) == 0) {
+            system_samples[trial] = timer(size, iterations, system_function, file_descriptor);
+            iris_samples[trial] = timer(size, iterations, iris_function, file_descriptor);
+        } else {
+            iris_samples[trial] = timer(size, iterations, iris_function, file_descriptor);
+            system_samples[trial] = timer(size, iterations, system_function, file_descriptor);
+        }
+    }
+
+    double system_median = median(system_samples);
+    double iris_median = median(iris_samples);
+    printf("| %-8s | %8zu | %16.2f | %16.2f | %15.2fx |\n", label, size,
+        system_median, iris_median,
+        iris_median > 0.0 ? system_median / iris_median : 0.0);
+}
+
+static double median(double samples[TRIALS])
+{
+    for (size_t index = 0; index < TRIALS; index++) {
+        for (size_t next = index + 1; next < TRIALS; next++) {
+            if (samples[next] < samples[index]) {
+                double temporary = samples[index];
+                samples[index] = samples[next];
+                samples[next] = temporary;
+            }
+        }
+    }
+
+    if (TRIALS % 2 == 0) {
+        return (samples[TRIALS / 2 - 1] + samples[TRIALS / 2]) / 2.0;
+    }
+    return samples[TRIALS / 2];
+}
+
+#define REPORT(label, size, iterations, timer, member, system_function, iris_function) \
+    do { \
+        double system_samples[TRIALS]; \
+        double iris_samples[TRIALS]; \
+        benchmark_function system_call = { .member = system_function }; \
+        benchmark_function iris_call = { .member = iris_function }; \
+        for (size_t trial = 0; trial < TRIALS; trial++) { \
+            if ((trial & 1U) == 0) { \
+                system_samples[trial] = timer(size, iterations, system_call); \
+                iris_samples[trial] = timer(size, iterations, iris_call); \
+            } else { \
+                iris_samples[trial] = timer(size, iterations, iris_call); \
+                system_samples[trial] = timer(size, iterations, system_call); \
+            } \
+        } \
+        double system_median = median(system_samples); \
+        double iris_median = median(iris_samples); \
+        printf("| %-8s | %8zu | %16.2f | %16.2f | %15.2fx |\n", #label, size, \
+            system_median, iris_median, \
+            iris_median > 0.0 ? system_median / iris_median : 0.0); \
+    } while (0)
+
+int main(void)
+{
+    const size_t sizes[] = { 16, 256, 4096, MAX_SIZE };
+    const size_t size_count = sizeof(sizes) / sizeof(sizes[0]);
+
+    for (size_t index = 0; index < MAX_SIZE; index++) {
+        source_data[index] = (unsigned char)(index * 31U + 7U);
+        compare_data[index] = source_data[index];
+        left_text[index] = (char)('a' + index % 26U);
+        right_text[index] = left_text[index];
+    }
+
+    printf("Iris libc vs %s; median of %d trials\n", BENCH_LIBC_NAME, TRIALS);
+    puts("+----------+----------+------------------+------------------+------------------+");
+    printf("| %-8s | %8s | %-16s | %-16s | %-16s |\n",
+        "Function", "Size (B)", "libc ns/op", "Iris ns/op", "speedup");
+    puts("+----------+----------+------------------+------------------+------------------+");
+
+    for (size_t index = 0; index < size_count; index++) {
+        size_t size = sizes[index];
+        size_t iterations = iterations_for(size);
+
+        REPORT(memcpy, size, iterations, time_copy, copy, memcpy, iris_memcpy);
+        REPORT(memmove, size, iterations, time_move, move, memmove, iris_memmove);
+        REPORT(memset, size, iterations, time_set, set, memset, iris_memset);
+        REPORT(memcmp, size, iterations, time_memory_compare, memory_compare, memcmp, iris_memcmp);
+        REPORT(strlen, size, iterations, time_length, length, strlen, iris_strlen);
+        REPORT(strcmp, size, iterations, time_string_compare, string_compare, strcmp, iris_strcmp);
+        REPORT(strncmp, size, iterations, time_string_ncompare, string_ncompare, strncmp, iris_strncmp);
+    }
+
+    puts("+----------+----------+------------------+------------------+------------------+");
+
+    int read_descriptor = open("/dev/zero", O_RDONLY);
+    int write_descriptor = open("/dev/null", O_WRONLY);
+    if (read_descriptor < 0 || write_descriptor < 0) {
+        perror("open benchmark device");
+        if (read_descriptor >= 0) {
+            close(read_descriptor);
+        }
+        if (write_descriptor >= 0) {
+            close(write_descriptor);
+        }
+        return 1;
+    }
+
+    printf("Linux read/write/close syscalls vs %s; median of 6 trials\n", BENCH_LIBC_NAME);
+    puts("+----------+----------+------------------+------------------+------------------+");
+    printf("| %-8s | %8s | %-16s | %-16s | %-16s |\n",
+        "Function", "Size (B)", "libc ns/op", "Iris ns/op", "speedup");
+    puts("+----------+----------+------------------+------------------+------------------+");
+    for (size_t size = 1; size <= sizeof(io_buffer); size *= 64) {
+        report_io("read", size, IO_ITERATIONS, time_read,
+            (io_benchmark_function){ .read = read },
+            (io_benchmark_function){ .read = iris_read }, read_descriptor);
+        report_io("write", size, IO_ITERATIONS, time_write,
+            (io_benchmark_function){ .write = write },
+            (io_benchmark_function){ .write = iris_write }, write_descriptor);
+    }
+    report_io("close", 0, CLOSE_ITERATIONS, time_close,
+        (io_benchmark_function){ .close = close },
+        (io_benchmark_function){ .close = iris_close }, -1);
+    close(read_descriptor);
+    close(write_descriptor);
+    puts("+----------+----------+------------------+------------------+------------------+");
+    fprintf(stderr, "benchmark checksum: %zu\n", benchmark_sink);
+    return 0;
+}
