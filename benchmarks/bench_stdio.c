@@ -29,10 +29,16 @@ extern int iris_vsnprintf(char *buffer, size_t size, const char *format, va_list
 extern iris_FILE *iris_fopen(const char *path, const char *mode);
 extern int iris_fclose(iris_FILE *stream);
 extern int iris_fflush(iris_FILE *stream);
+extern int iris_fseek(iris_FILE *stream, long offset, int whence);
+extern long iris_ftell(iris_FILE *stream);
+extern void iris_rewind(iris_FILE *stream);
 extern size_t iris_fread(void *buffer, size_t size, size_t count, iris_FILE *stream);
 extern size_t iris_fwrite(const void *buffer, size_t size, size_t count, iris_FILE *stream);
 extern int iris_fgetc(iris_FILE *stream);
 extern int iris_fputc(int character, iris_FILE *stream);
+extern char *iris_fgets(char *buffer, int count, iris_FILE *stream);
+extern int iris_fputs(const char *string, iris_FILE *stream);
+extern int iris_puts(const char *string);
 extern int iris_feof(iris_FILE *stream);
 extern int iris_ferror(iris_FILE *stream);
 extern void iris_clearerr(iris_FILE *stream);
@@ -265,6 +271,30 @@ static int iris_fputc_operation(void *opaque)
     return iris_fputc('x', context->stream);
 }
 
+static int host_fgets_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return fgets((char *)context->data, sizeof(context->data), context->stream) != NULL;
+}
+
+static int iris_fgets_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_fgets((char *)context->data, sizeof(context->data), context->stream) != NULL;
+}
+
+static int host_fputs_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return fputs(context->text, context->stream);
+}
+
+static int iris_fputs_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_fputs(context->text, context->stream);
+}
+
 static int host_fflush_operation(void *opaque)
 {
     struct host_context *context = opaque;
@@ -312,6 +342,44 @@ static int iris_clearerr_operation(void *opaque)
 {
     struct iris_context *context = opaque;
     iris_clearerr(context->stream);
+    return 0;
+}
+
+static int host_fseek_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return fseek(context->stream, 128, SEEK_SET);
+}
+
+static int iris_fseek_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_fseek(context->stream, 128, SEEK_SET);
+}
+
+static int host_ftell_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return (int)ftell(context->stream);
+}
+
+static int iris_ftell_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return (int)iris_ftell(context->stream);
+}
+
+static int host_rewind_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    rewind(context->stream);
+    return 0;
+}
+
+static int iris_rewind_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    iris_rewind(context->stream);
     return 0;
 }
 
@@ -383,12 +451,46 @@ static double time_iris_stdout(size_t iterations, int use_vprintf)
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
+static double time_host_puts(size_t iterations)
+{
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = puts("iris line");
+    }
+    fflush(stdout);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_iris_puts(size_t iterations)
+{
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = iris_puts("iris line");
+    }
+    iris_fflush(iris_stdout);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
 static int report_stdout_functions(int saved_stdout, int null_descriptor)
 {
     double host_printf[TRIALS];
     double iris_printf_samples[TRIALS];
     double host_vprintf[TRIALS];
     double iris_vprintf_samples[TRIALS];
+    double host_puts_samples[TRIALS];
+    double iris_puts_samples[TRIALS];
 
     if (fflush(stdout) != 0 || iris_fflush(iris_stdout) != 0 ||
         dup2(null_descriptor, STDOUT_FILENO) < 0) {
@@ -402,11 +504,15 @@ static int report_stdout_functions(int saved_stdout, int null_descriptor)
             iris_printf_samples[trial] = time_iris_stdout(FORMAT_ITERATIONS, 0);
             host_vprintf[trial] = time_host_stdout(FORMAT_ITERATIONS, 1);
             iris_vprintf_samples[trial] = time_iris_stdout(FORMAT_ITERATIONS, 1);
+            host_puts_samples[trial] = time_host_puts(FORMAT_ITERATIONS);
+            iris_puts_samples[trial] = time_iris_puts(FORMAT_ITERATIONS);
         } else {
             iris_printf_samples[trial] = time_iris_stdout(FORMAT_ITERATIONS, 0);
             host_printf[trial] = time_host_stdout(FORMAT_ITERATIONS, 0);
             iris_vprintf_samples[trial] = time_iris_stdout(FORMAT_ITERATIONS, 1);
             host_vprintf[trial] = time_host_stdout(FORMAT_ITERATIONS, 1);
+            iris_puts_samples[trial] = time_iris_puts(FORMAT_ITERATIONS);
+            host_puts_samples[trial] = time_host_puts(FORMAT_ITERATIONS);
         }
     }
     fflush(stdout);
@@ -427,6 +533,10 @@ static int report_stdout_functions(int saved_stdout, int null_descriptor)
     host_median = median(host_vprintf);
     iris_median = median(iris_vprintf_samples);
     printf("| %-16s | %16.2f | %16.2f | %15.2fx |\n", "vprintf",
+        host_median, iris_median, host_median / iris_median);
+    host_median = median(host_puts_samples);
+    iris_median = median(iris_puts_samples);
+    printf("| %-16s | %16.2f | %16.2f | %15.2fx |\n", "puts",
         host_median, iris_median, host_median / iris_median);
     puts("+------------------+------------------+------------------+------------------+");
     return 0;
@@ -533,9 +643,15 @@ int main(void)
     iris_FILE *iris_output = iris_fopen("/dev/null", "w");
     FILE *host_eof = fopen("/dev/null", "r");
     iris_FILE *iris_eof = iris_fopen("/dev/null", "r");
+    FILE *host_position = fopen("/dev/zero", "r");
+    iris_FILE *iris_position = iris_fopen("/dev/zero", "r");
+    FILE *host_rewind_stream = fopen("/dev/zero", "r");
+    iris_FILE *iris_rewind_stream = iris_fopen("/dev/zero", "r");
     if (host_format_stream == NULL || iris_format_stream == NULL ||
         host_input == NULL || iris_input == NULL || host_output == NULL ||
-        iris_output == NULL || host_eof == NULL || iris_eof == NULL) {
+        iris_output == NULL || host_eof == NULL || iris_eof == NULL ||
+        host_position == NULL || iris_position == NULL ||
+        host_rewind_stream == NULL || iris_rewind_stream == NULL) {
         perror("open stdio benchmark streams");
         return 1;
     }
@@ -548,10 +664,18 @@ int main(void)
     struct iris_context iris_writer = { .stream = iris_output };
     struct host_context host_eof_context = { .stream = host_eof };
     struct iris_context iris_eof_context = { .stream = iris_eof };
+    struct host_context host_position_context = { .stream = host_position };
+    struct iris_context iris_position_context = { .stream = iris_position };
+    struct host_context host_rewind_context = { .stream = host_rewind_stream };
+    struct iris_context iris_rewind_context = { .stream = iris_rewind_stream };
     memset(host_writer.data, 'x', sizeof(host_writer.data));
     memset(iris_writer.data, 'x', sizeof(iris_writer.data));
+    memcpy(host_writer.text, "benchmark", 10);
+    memcpy(iris_writer.text, "benchmark", 10);
     fgetc(host_eof);
     iris_fgetc(iris_eof);
+    fgetc(host_position);
+    iris_fgetc(iris_position);
 
     printf("All declared stdio.h functions vs %s; median of %d trials\n",
         BENCH_LIBC_NAME, TRIALS);
@@ -579,6 +703,11 @@ int main(void)
     report("fputc", STREAM_ITERATIONS, host_fputc_operation, &host_writer,
         (stdio_operation)host_fflush_operation, iris_fputc_operation, &iris_writer,
         (stdio_operation)iris_fflush_operation);
+    report("fgets", STREAM_ITERATIONS, host_fgets_operation, &host_reader, NULL,
+        iris_fgets_operation, &iris_reader, NULL);
+    report("fputs", STREAM_ITERATIONS, host_fputs_operation, &host_writer,
+        (stdio_operation)host_fflush_operation, iris_fputs_operation, &iris_writer,
+        (stdio_operation)iris_fflush_operation);
     report("fflush", STREAM_ITERATIONS, host_fflush_operation, &host_writer, NULL,
         iris_fflush_operation, &iris_writer, NULL);
     report("feof", STREAM_ITERATIONS, host_feof_operation, &host_eof_context, NULL,
@@ -587,6 +716,12 @@ int main(void)
         iris_ferror_operation, &iris_reader, NULL);
     report("clearerr", STREAM_ITERATIONS, host_clearerr_operation, &host_eof_context,
         NULL, iris_clearerr_operation, &iris_eof_context, NULL);
+    report("ftell", STREAM_ITERATIONS, host_ftell_operation, &host_position_context,
+        NULL, iris_ftell_operation, &iris_position_context, NULL);
+    report("fseek", STREAM_ITERATIONS, host_fseek_operation, &host_position_context,
+        NULL, iris_fseek_operation, &iris_position_context, NULL);
+    report("rewind", STREAM_ITERATIONS, host_rewind_operation, &host_rewind_context,
+        NULL, iris_rewind_operation, &iris_rewind_context, NULL);
     report("fopen+close", STREAM_ITERATIONS, host_open_close_operation,
         NULL, NULL, iris_open_close_operation, NULL, NULL);
     report_fclose();
@@ -600,6 +735,10 @@ int main(void)
     iris_fclose(iris_output);
     fclose(host_eof);
     iris_fclose(iris_eof);
+    fclose(host_position);
+    iris_fclose(iris_position);
+    fclose(host_rewind_stream);
+    iris_fclose(iris_rewind_stream);
     fprintf(stderr, "stdio benchmark checksum: %zu\n", benchmark_sink);
     return 0;
 }

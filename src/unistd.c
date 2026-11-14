@@ -8,7 +8,31 @@
 #define IRIS_SYS_WRITE 1
 #define IRIS_SYS_CLOSE 3
 #define IRIS_SYS_LSEEK 8
+#define IRIS_SYS_GETPID 39
+#define IRIS_SYS_EXIT_GROUP 231
 #define IRIS_SYS_OPENAT 257
+
+static long linux_syscall0(long number)
+{
+    long result;
+
+    __asm__ volatile("syscall"
+        : "=a"(result)
+        : "a"(number)
+        : "rcx", "r11", "memory");
+    return result;
+}
+
+static long linux_syscall1(long number, long first)
+{
+    long result;
+
+    __asm__ volatile("syscall"
+        : "=a"(result)
+        : "a"(number), "D"(first)
+        : "rcx", "r11", "memory");
+    return result;
+}
 
 static long linux_syscall3(long number, long first, long second, long third)
 {
@@ -37,7 +61,33 @@ static long linux_syscall4(long number, long first, long second, long third, lon
 #define IRIS_SYS_WRITE 64
 #define IRIS_SYS_CLOSE 57
 #define IRIS_SYS_LSEEK 62
+#define IRIS_SYS_EXIT_GROUP 94
+#define IRIS_SYS_GETPID 172
 #define IRIS_SYS_OPENAT 56
+
+static long linux_syscall0(long number)
+{
+    register long result __asm__("x0");
+    register long syscall_number __asm__("x8") = number;
+
+    __asm__ volatile("svc 0"
+        : "=r"(result)
+        : "r"(syscall_number)
+        : "memory", "cc");
+    return result;
+}
+
+static long linux_syscall1(long number, long first)
+{
+    register long result __asm__("x0") = first;
+    register long syscall_number __asm__("x8") = number;
+
+    __asm__ volatile("svc 0"
+        : "+r"(result)
+        : "r"(syscall_number)
+        : "memory", "cc");
+    return result;
+}
 
 static long linux_syscall3(long number, long first, long second, long third)
 {
@@ -72,11 +122,17 @@ static long linux_syscall4(long number, long first, long second, long third, lon
 #error "Iris unistd currently requires Linux on x86-64 or AArch64"
 #endif
 
-static long syscall_result(long result)
+__attribute__((noinline, cold))
+static long syscall_error(long result)
 {
-    if (result < 0 && result >= -4095) {
-        errno = (int)-result;
-        return -1;
+    errno = (int)-result;
+    return -1;
+}
+
+static inline long syscall_result(long result)
+{
+    if (__builtin_expect((unsigned long)result >= (unsigned long)-4095L, 0)) {
+        return syscall_error(result);
     }
     return result;
 }
@@ -95,8 +151,7 @@ ssize_t write(int file_descriptor, const void *buffer, size_t count)
 
 int close(int file_descriptor)
 {
-    return (int)syscall_result(linux_syscall3(IRIS_SYS_CLOSE,
-        file_descriptor, 0, 0));
+    return (int)syscall_result(linux_syscall1(IRIS_SYS_CLOSE, file_descriptor));
 }
 
 int open(const char *path, int flags, ...)
@@ -116,4 +171,16 @@ off_t lseek(int file_descriptor, off_t offset, int whence)
 {
     return (off_t)syscall_result(linux_syscall3(IRIS_SYS_LSEEK,
         file_descriptor, (long)offset, whence));
+}
+
+_Noreturn void _exit(int status)
+{
+    linux_syscall1(IRIS_SYS_EXIT_GROUP, status);
+    for (;;) {
+    }
+}
+
+pid_t getpid(void)
+{
+    return (pid_t)syscall_result(linux_syscall0(IRIS_SYS_GETPID));
 }

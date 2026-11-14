@@ -291,13 +291,16 @@ static size_t strlen_sse2(const unsigned char *string)
     }
 }
 
-static unsigned int string_chunk_stop_mask(__m128i left, __m128i right)
+static inline __attribute__((always_inline))
+unsigned int string_chunk_stop_mask(__m128i left, __m128i right)
 {
     const __m128i zero = _mm_setzero_si128();
-    unsigned int equal_mask = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(left, right));
-    unsigned int zero_mask = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(left, zero));
+    __m128i equal = _mm_cmpeq_epi8(left, right);
+    __m128i is_zero = _mm_cmpeq_epi8(left, zero);
+    unsigned int ok_mask = (unsigned int)_mm_movemask_epi8(
+        _mm_andnot_si128(is_zero, equal));
 
-    return ((~equal_mask) & 0xffffU) | zero_mask;
+    return ok_mask ^ 0xffffU;
 }
 
 static int compare_strings_sse2(const unsigned char *left, const unsigned char *right,
@@ -382,6 +385,7 @@ static void cpuid(unsigned int leaf, unsigned int subleaf, unsigned int *eax_out
     *edx_out = edx;
 }
 
+__attribute__((noinline, cold))
 static int detect_avx2(void)
 {
     unsigned int eax;
@@ -420,6 +424,7 @@ static inline int cpu_has_avx2(void)
     return supported;
 }
 
+__attribute__((noinline, cold))
 static int detect_avx512(void)
 {
     unsigned int eax;
@@ -706,6 +711,23 @@ static void *set_avx512(void *destination, int value, size_t count)
         _mm512_storeu_si512((void *)(output + 64), pattern);
         _mm512_storeu_si512((void *)(output + count - 128), pattern);
         _mm512_storeu_si512((void *)(output + count - 64), pattern);
+        return destination;
+    }
+
+    if (count <= 256) {
+        _mm512_storeu_si512((void *)output, pattern);
+        _mm512_storeu_si512((void *)(output + 64), pattern);
+        _mm512_storeu_si512((void *)(output + count - 128), pattern);
+        _mm512_storeu_si512((void *)(output + count - 64), pattern);
+        return destination;
+    }
+
+    if (count >= 262144) {
+        __asm__ volatile(
+            "rep stosb"
+            : "+D"(output), "+c"(count)
+            : "a"((unsigned char)value)
+            : "memory");
         return destination;
     }
 
@@ -1225,7 +1247,30 @@ static int compare_strings_avx512(const unsigned char *left, const unsigned char
             right += 256;
             safe_room -= 256;
         }
-        if (safe_room >= 32) {
+        if (safe_room >= 128) {
+            size_t stop_index;
+
+            if (compare_block_avx512_128(left, right, &stop_index)) {
+                return (int)left[stop_index] - (int)right[stop_index];
+            }
+            left += 128;
+            right += 128;
+            safe_room -= 128;
+        }
+        if (safe_room >= 64) {
+            __m512i left_chunk = _mm512_loadu_si512((const void *)left);
+            __m512i right_chunk = _mm512_loadu_si512((const void *)right);
+            uint64_t stop_mask = string_chunk_stop_mask_avx512_64(left_chunk, right_chunk);
+
+            if (stop_mask != 0) {
+                size_t index = (size_t)__builtin_ctzll(stop_mask);
+                return (int)left[index] - (int)right[index];
+            }
+            left += 64;
+            right += 64;
+            safe_room -= 64;
+        }
+        while (safe_room >= 32) {
             __m256i left_chunk = _mm256_loadu_si256((const __m256i *)left);
             __m256i right_chunk = _mm256_loadu_si256((const __m256i *)right);
             unsigned int stop_mask = string_chunk_stop_mask_avx512(left_chunk, right_chunk);
@@ -1237,10 +1282,6 @@ static int compare_strings_avx512(const unsigned char *left, const unsigned char
             left += 32;
             right += 32;
             safe_room -= 32;
-            continue;
-        }
-        if (safe_room == 0) {
-            continue;
         }
         while (safe_room > 0) {
             if (*left != *right) {
@@ -1268,7 +1309,21 @@ static int compare_n_strings_avx512(const unsigned char *left, const unsigned ch
         size_t right_room = 4096U - ((uintptr_t)right & 4095U);
         size_t safe_room = left_room < right_room ? left_room : right_room;
 
-        while (count >= 128 && safe_room >= 128) {
+        while (count >= 256 && safe_room >= 256) {
+            size_t stop_index;
+
+            if (compare_block_avx512(left, right, &stop_index)) {
+                return (int)left[stop_index] - (int)right[stop_index];
+            }
+            left += 256;
+            right += 256;
+            count -= 256;
+            safe_room -= 256;
+        }
+        if (count == 0) {
+            return 0;
+        }
+        if (count >= 128 && safe_room >= 128) {
             size_t stop_index;
 
             if (compare_block_avx512_128(left, right, &stop_index)) {
@@ -1279,10 +1334,21 @@ static int compare_n_strings_avx512(const unsigned char *left, const unsigned ch
             count -= 128;
             safe_room -= 128;
         }
-        if (count == 0) {
-            return 0;
+        if (count >= 64 && safe_room >= 64) {
+            __m512i left_chunk = _mm512_loadu_si512((const void *)left);
+            __m512i right_chunk = _mm512_loadu_si512((const void *)right);
+            uint64_t stop_mask = string_chunk_stop_mask_avx512_64(left_chunk, right_chunk);
+
+            if (stop_mask != 0) {
+                size_t index = (size_t)__builtin_ctzll(stop_mask);
+                return (int)left[index] - (int)right[index];
+            }
+            left += 64;
+            right += 64;
+            count -= 64;
+            safe_room -= 64;
         }
-        if (count >= 32 && safe_room >= 32) {
+        while (count >= 32 && safe_room >= 32) {
             __m256i left_chunk = _mm256_loadu_si256((const __m256i *)left);
             __m256i right_chunk = _mm256_loadu_si256((const __m256i *)right);
             unsigned int stop_mask = string_chunk_stop_mask_avx512(left_chunk, right_chunk);
@@ -1295,7 +1361,9 @@ static int compare_n_strings_avx512(const unsigned char *left, const unsigned ch
             right += 32;
             count -= 32;
             safe_room -= 32;
-            continue;
+        }
+        if (count == 0) {
+            return 0;
         }
         if (safe_room == 0) {
             continue;
@@ -1319,34 +1387,53 @@ static int compare_n_strings_avx512(const unsigned char *left, const unsigned ch
 #endif
 
 #if defined(__x86_64__)
-void *memcpy(void *restrict destination, const void *restrict source, size_t count)
-{
-    unsigned char *output = destination;
-    const unsigned char *input = source;
-
-
-    if (count == 16) {
-        __m128i value = _mm_loadu_si128((const __m128i *)input);
-        _mm_storeu_si128((__m128i *)output, value);
-        return destination;
-    }
-    if (count < 16) {
-        copy_tiny(output, input, count);
-        return destination;
-    }
-    if (count <= 64) {
-        copy_small(output, input, count);
-        return destination;
-    }
 #if defined(IRIS_HAVE_AVX2)
-    if (cpu_has_avx512()) {
+static atomic_int cached_avx512_fast = ATOMIC_VAR_INIT(-1);
+
+__attribute__((noinline))
+static void *memcpy_fallback(unsigned char *output, const unsigned char *input, size_t count)
+{
+    int supported = atomic_load_explicit(&cached_avx512_fast, memory_order_relaxed);
+    if (supported < 0) {
+        supported = detect_avx512();
+        atomic_store_explicit(&cached_avx512_fast, supported, memory_order_relaxed);
+    }
+    if (supported > 0) {
         return copy_avx512(output, input, count);
     }
     if (cpu_has_avx2()) {
         return copy_avx2(output, input, count);
     }
-#endif
     return copy_sse2(output, input, count);
+}
+#endif
+
+void *memcpy(void *restrict destination, const void *restrict source, size_t count)
+{
+    unsigned char *output = destination;
+    const unsigned char *input = source;
+
+    if (count <= 64) {
+        if (count == 16) {
+            __m128i value = _mm_loadu_si128((const __m128i *)input);
+            _mm_storeu_si128((__m128i *)output, value);
+            return destination;
+        }
+        if (count < 16) {
+            copy_tiny(output, input, count);
+            return destination;
+        }
+        copy_small(output, input, count);
+        return destination;
+    }
+#if defined(IRIS_HAVE_AVX2)
+    if (__builtin_expect(atomic_load_explicit(&cached_avx512_fast, memory_order_relaxed) > 0, 1)) {
+        return copy_avx512(output, input, count);
+    }
+    return memcpy_fallback(output, input, count);
+#else
+    return copy_sse2(output, input, count);
+#endif
 }
 
 void *memmove(void *destination, const void *source, size_t count)
@@ -1386,11 +1473,16 @@ void *memset(void *destination, int value, size_t count)
     unsigned char *output = destination;
     unsigned char byte = (unsigned char)value;
 
-    if (count <= 16) {
-        set_tiny(output, byte, count);
-        return destination;
-    }
     if (count <= 64) {
+        if (count == 16) {
+            __m128i chunk = _mm_set1_epi8((char)byte);
+            _mm_storeu_si128((__m128i *)output, chunk);
+            return destination;
+        }
+        if (count < 16) {
+            set_tiny(output, byte, count);
+            return destination;
+        }
         set_small(output, byte, count);
         return destination;
     }
@@ -1429,14 +1521,14 @@ int memcmp(const void *left, const void *right, size_t count)
         unsigned int equal_mask = (unsigned int)_mm_movemask_epi8(
             _mm_cmpeq_epi8(left_chunk, right_chunk));
 
-        if (equal_mask != 0xffffU) {
-            size_t index = (size_t)__builtin_ctz((~equal_mask) & 0xffffU);
-            return (int)((const unsigned char *)left)[index] -
-                (int)((const unsigned char *)right)[index];
+        if (__builtin_expect(equal_mask == 0xffffU, 1)) {
+            return 0;
         }
-        return 0;
+        size_t index = (size_t)__builtin_ctz((~equal_mask) & 0xffffU);
+        return (int)((const unsigned char *)left)[index] -
+            (int)((const unsigned char *)right)[index];
     }
-    if (count >= 16) {
+    if (count > 16) {
         return memcmp_sse2(left, right, count);
     }
     return compare_bytes(left, right, count);
@@ -1445,24 +1537,21 @@ int memcmp(const void *left, const void *right, size_t count)
 size_t strlen(const char *string)
 {
     const unsigned char *bytes = (const unsigned char *)string;
-    size_t page_room = 4096U - ((uintptr_t)bytes & 4095U);
 
-    if (page_room >= 32) {
+    if (__builtin_expect(((uintptr_t)bytes & 4095U) <= 4096U - 32U, 1)) {
         const __m128i zero = _mm_setzero_si128();
         __m128i first = _mm_loadu_si128((const __m128i *)bytes);
         unsigned int zero_mask = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(first, zero));
 
-        if (zero_mask != 0) {
+        if (__builtin_expect(zero_mask != 0, 1)) {
             return (size_t)__builtin_ctz(zero_mask);
         }
         __m128i second = _mm_loadu_si128((const __m128i *)(bytes + 16));
         unsigned int second_zero_mask = (unsigned int)_mm_movemask_epi8(
             _mm_cmpeq_epi8(second, zero));
-        if (second_zero_mask != 0) {
+        if (__builtin_expect(second_zero_mask != 0, 1)) {
             return 16 + (size_t)__builtin_ctz(second_zero_mask);
         }
-        /* Longer strings use the scanner's original alignment and wide
-         * chunks, which benchmark better than starting it at byte 32. */
     }
 #if defined(IRIS_HAVE_AVX2)
     if (cpu_has_avx512()) {
@@ -1479,10 +1568,10 @@ int strcmp(const char *left, const char *right)
 {
     const unsigned char *left_bytes = (const unsigned char *)left;
     const unsigned char *right_bytes = (const unsigned char *)right;
-    size_t left_room = 4096U - ((uintptr_t)left_bytes & 4095U);
-    size_t right_room = 4096U - ((uintptr_t)right_bytes & 4095U);
+    size_t left_off = (uintptr_t)left_bytes & 4095U;
+    size_t right_off = (uintptr_t)right_bytes & 4095U;
 
-    if (left_room >= 16 && right_room >= 16) {
+    if (__builtin_expect((left_off <= 4096U - 32U) & (right_off <= 4096U - 32U), 1)) {
         __m128i left0 = _mm_loadu_si128((const __m128i *)left_bytes);
         __m128i right0 = _mm_loadu_si128((const __m128i *)right_bytes);
         unsigned int stop_mask = string_chunk_stop_mask(left0, right0);
@@ -1490,19 +1579,15 @@ int strcmp(const char *left, const char *right)
             size_t index = (size_t)__builtin_ctz(stop_mask);
             return (int)left_bytes[index] - (int)right_bytes[index];
         }
-        left_room -= 16;
-        right_room -= 16;
-        if (left_room >= 16 && right_room >= 16) {
-            __m128i left1 = _mm_loadu_si128((const __m128i *)(left_bytes + 16));
-            __m128i right1 = _mm_loadu_si128((const __m128i *)(right_bytes + 16));
-            stop_mask = string_chunk_stop_mask(left1, right1);
-            if (stop_mask != 0) {
-                size_t index = 16 + (size_t)__builtin_ctz(stop_mask);
-                return (int)left_bytes[index] - (int)right_bytes[index];
-            }
-            left_bytes += 32;
-            right_bytes += 32;
+        __m128i left1 = _mm_loadu_si128((const __m128i *)(left_bytes + 16));
+        __m128i right1 = _mm_loadu_si128((const __m128i *)(right_bytes + 16));
+        stop_mask = string_chunk_stop_mask(left1, right1);
+        if (__builtin_expect(stop_mask != 0, 1)) {
+            size_t index = 16 + (size_t)__builtin_ctz(stop_mask);
+            return (int)left_bytes[index] - (int)right_bytes[index];
         }
+        left_bytes += 32;
+        right_bytes += 32;
     }
 #if defined(IRIS_HAVE_AVX2)
     if (cpu_has_avx512()) {
@@ -1517,6 +1602,16 @@ int strcmp(const char *left, const char *right)
 
 int strncmp(const char *left, const char *right, size_t count)
 {
+    if (count == 16) {
+        __m128i left_chunk = _mm_loadu_si128((const __m128i *)left);
+        __m128i right_chunk = _mm_loadu_si128((const __m128i *)right);
+        unsigned int stop_mask = string_chunk_stop_mask(left_chunk, right_chunk);
+        if (__builtin_expect(stop_mask != 0, 1)) {
+            size_t index = (size_t)__builtin_ctz(stop_mask);
+            return (int)(unsigned char)left[index] - (int)(unsigned char)right[index];
+        }
+        return 0;
+    }
     if (count < 16) {
         for (size_t index = 0; index < count; index++) {
             unsigned char left_char = (unsigned char)left[index];
@@ -1527,16 +1622,6 @@ int strncmp(const char *left, const char *right, size_t count)
             if (left_char == '\0') {
                 return 0;
             }
-        }
-        return 0;
-    }
-    if (count == 16) {
-        __m128i left_chunk = _mm_loadu_si128((const __m128i *)left);
-        __m128i right_chunk = _mm_loadu_si128((const __m128i *)right);
-        unsigned int stop_mask = string_chunk_stop_mask(left_chunk, right_chunk);
-        if (stop_mask != 0) {
-            size_t index = (size_t)__builtin_ctz(stop_mask);
-            return (int)(unsigned char)left[index] - (int)(unsigned char)right[index];
         }
         return 0;
     }

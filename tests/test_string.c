@@ -381,7 +381,8 @@ static int check_file_streams(void)
     }
     if (fwrite(original, 1, sizeof(original) - 1, stream) !=
         sizeof(original) - 1 || fprintf(stream, "-%d", 7) != 2 ||
-        print_stream_variadic(stream, ":%s", "ok") != 3 || fflush(stream) != 0) {
+        print_stream_variadic(stream, ":%s", "ok") != 3 || ftell(stream) != 10 ||
+        fseek(stream, 0, SEEK_CUR) != 0 || ftell(stream) != 10 || fflush(stream) != 0) {
         fclose(stream);
         unlink(path);
         return 1;
@@ -397,10 +398,57 @@ static int check_file_streams(void)
         return 2;
     }
     if (fread(actual, 1, 3, stream) != 3 || actual[0] != 'a' || actual[1] != 'b' ||
-        actual[2] != 'c') {
+        actual[2] != 'c' || ftell(stream) != 3) {
         fclose(stream);
         unlink(path);
         return 3;
+    }
+    if (fseek(stream, 1, SEEK_SET) != 0 || ftell(stream) != 1) {
+        fclose(stream);
+        unlink(path);
+        return 21;
+    }
+    if (fgetc(stream) != 'b' || ftell(stream) != 2) {
+        fclose(stream);
+        unlink(path);
+        return 22;
+    }
+    if (fseek(stream, -1, SEEK_CUR) != 0) {
+        fclose(stream);
+        unlink(path);
+        return 23;
+    }
+    long relative_position = ftell(stream);
+    if (relative_position != 1) {
+        fclose(stream);
+        unlink(path);
+        return 28;
+    }
+    if (fgetc(stream) != 'b') {
+        fclose(stream);
+        unlink(path);
+        return 27;
+    }
+    if (fseek(stream, -2, SEEK_END) != 0 || ftell(stream) != 8) {
+        fclose(stream);
+        unlink(path);
+        return 24;
+    }
+    if (fgetc(stream) != 'o' || ftell(stream) != 9) {
+        fclose(stream);
+        unlink(path);
+        return 25;
+    }
+    rewind(stream);
+    if (ftell(stream) != 0 || fgetc(stream) != 'a') {
+        fclose(stream);
+        unlink(path);
+        return 18;
+    }
+    if (fseek(stream, 3, SEEK_SET) != 0) {
+        fclose(stream);
+        unlink(path);
+        return 30;
     }
     if (fputc('X', stream) != 'X' || fclose(stream) != 0) {
         unlink(path);
@@ -428,6 +476,29 @@ static int check_file_streams(void)
         fclose(stream);
         unlink(path);
         return 13;
+    }
+    if (fseek(stream, 0, SEEK_SET) != 0 || feof(stream) || ftell(stream) != 0 ||
+        fgetc(stream) != 'a') {
+        fclose(stream);
+        unlink(path);
+        return 19;
+    }
+    if (fseek(stream, 0, 12345) != EOF || !ferror(stream)) {
+        fclose(stream);
+        unlink(path);
+        return 20;
+    }
+    clearerr(stream);
+    if (fseek(stream, 0, SEEK_END) != 0 || fgetc(stream) != EOF || !feof(stream)) {
+        fclose(stream);
+        unlink(path);
+        return 31;
+    }
+    rewind(stream);
+    if (feof(stream) || ferror(stream) || ftell(stream) != 0 || fgetc(stream) != 'a') {
+        fclose(stream);
+        unlink(path);
+        return 32;
     }
     if (fclose(stream) != 0 || unlink(path) != 0) {
         return 6;
@@ -522,6 +593,73 @@ static int check_bulk_file_streams(void)
     return 0;
 }
 
+static int check_line_streams(void)
+{
+    const char *path = "/tmp/iris-libc-stdio-lines-test";
+    char line[32];
+    unlink(path);
+
+    FILE *stream = fopen(path, "w");
+    if (stream == NULL) {
+        unlink(path);
+        return 1;
+    }
+    if (fputs("1234567\nfirst\nsecond line is long\n", stream) == EOF) {
+        fclose(stream);
+        unlink(path);
+        return 1;
+    }
+    if (fclose(stream) != 0) {
+        unlink(path);
+        return 1;
+    }
+
+    stream = fopen(path, "r");
+    if (stream == NULL) {
+        unlink(path);
+        return 2;
+    }
+    line[0] = 'x';
+    if (fgets(line, 1, stream) != line || line[0] != '\0' ||
+        fgets(line, 9, stream) != line || strcmp(line, "1234567\n") != 0 ||
+        fgets(line, 7, stream) != line || strcmp(line, "first\n") != 0 ||
+        fgets(line, 8, stream) != line || strcmp(line, "second ") != 0 ||
+        fgets(line, sizeof(line), stream) != line ||
+        strcmp(line, "line is long\n") != 0 ||
+        fgets(line, sizeof(line), stream) != NULL || !feof(stream)) {
+        fclose(stream);
+        unlink(path);
+        return 3;
+    }
+    if (fclose(stream) != 0 || unlink(path) != 0) {
+        return 4;
+    }
+
+    stream = fopen(path, "w");
+    if (stream == NULL) {
+        unlink(path);
+        return 5;
+    }
+    if (fclose(stream) != 0) {
+        unlink(path);
+        return 5;
+    }
+    stream = fopen(path, "r");
+    if (stream == NULL || fgets(line, sizeof(line), stream) != NULL || !feof(stream)) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 6;
+    }
+    if (fclose(stream) != 0 || unlink(path) != 0) {
+        return 7;
+    }
+
+    if (puts("") < 0 || fflush(stdout) != 0) {
+        return 8;
+    }
+    return 0;
+}
+
 int main(void)
 {
     char buffer[8] = "iris";
@@ -582,6 +720,10 @@ int main(void)
     int bulk_stream_result = check_bulk_file_streams();
     if (bulk_stream_result != 0) {
         return 80 + bulk_stream_result;
+    }
+    int line_stream_result = check_line_streams();
+    if (line_stream_result != 0) {
+        return 100 + line_stream_result;
     }
 
     return 0;

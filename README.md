@@ -25,7 +25,8 @@ make file-copy SOURCE=input.bin DESTINATION=output.bin
 
 The build produces `libc.a`. Stdio includes `printf`, `vprintf`, `fprintf`,
 `vfprintf`, `snprintf`, `vsnprintf`, and buffered `FILE` streams with `fopen`, `fclose`, `fflush`,
-`fread`, `fwrite`, `fgetc`, and `fputc`. Formatting supports integer,
+`fseek`, `ftell`, `rewind`, `fread`, `fwrite`, `fgetc`, `fputc`, `fgets`,
+`fputs`, and `puts`. Formatting supports integer,
 character, string, and pointer conversions; floating-point formatting is not
 implemented yet. File streams currently use a fixed-size internal pool. Tests run against the host compiler and do not yet
 exercise AvoryOS integration. `make hello` builds and runs a host executable

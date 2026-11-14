@@ -175,8 +175,8 @@ int fflush(FILE *stream)
         if (flush_stream(&standard_error) != 0) failed = 1;
         for (size_t index = 0; index < STREAM_POOL_SIZE; index++) {
             FILE *candidate = &stream_pool[index];
-            if ((candidate->flags & (STREAM_ACTIVE | STREAM_WRITE)) ==
-                (STREAM_ACTIVE | STREAM_WRITE) && flush_stream(candidate) != 0) {
+            if ((candidate->flags & (STREAM_ACTIVE | STREAM_LAST_WRITE)) ==
+                (STREAM_ACTIVE | STREAM_LAST_WRITE) && flush_stream(candidate) != 0) {
                 failed = 1;
             }
         }
@@ -186,7 +186,7 @@ int fflush(FILE *stream)
         errno = EBADF;
         return EOF;
     }
-    if ((stream->flags & STREAM_WRITE) != 0 && flush_stream(stream) != 0) {
+    if ((stream->flags & STREAM_LAST_WRITE) != 0 && flush_stream(stream) != 0) {
         return EOF;
     }
     if ((stream->flags & STREAM_READ) != 0 &&
@@ -203,7 +203,7 @@ int fclose(FILE *stream)
         return EOF;
     }
     int failed = 0;
-    if ((stream->flags & STREAM_WRITE) != 0 && flush_stream(stream) != 0) {
+    if ((stream->flags & STREAM_LAST_WRITE) != 0 && flush_stream(stream) != 0) {
         failed = 1;
     }
     if ((stream->flags & STREAM_OWN_DESCRIPTOR) != 0 &&
@@ -214,6 +214,78 @@ int fclose(FILE *stream)
     stream->buffer_length = 0;
     stream->buffer_position = 0;
     return failed ? EOF : 0;
+}
+
+int fseek(FILE *stream, long offset, int whence)
+{
+    if (!stream_active(stream) ||
+        (stream->flags & (STREAM_READ | STREAM_WRITE)) == 0) {
+        errno = EBADF;
+        return EOF;
+    }
+    off_t converted_offset = (off_t)offset;
+    if ((long)converted_offset != offset) {
+        errno = EOVERFLOW;
+        stream->flags |= STREAM_ERROR;
+        return EOF;
+    }
+    if (fflush(stream) == EOF ||
+        lseek(stream->file_descriptor, converted_offset, whence) < 0) {
+        stream->flags |= STREAM_ERROR;
+        return EOF;
+    }
+    stream->buffer_length = 0;
+    stream->buffer_position = 0;
+    stream->flags &= ~(STREAM_EOF | STREAM_LAST_READ | STREAM_LAST_WRITE);
+    return 0;
+}
+
+long ftell(FILE *stream)
+{
+    if (!stream_active(stream) ||
+        (stream->flags & (STREAM_READ | STREAM_WRITE)) == 0) {
+        errno = EBADF;
+        return -1L;
+    }
+    off_t current = lseek(stream->file_descriptor, 0, SEEK_CUR);
+    if (current < 0) {
+        stream->flags |= STREAM_ERROR;
+        return -1L;
+    }
+
+    intmax_t logical_position = (intmax_t)current;
+    if ((stream->flags & STREAM_LAST_READ) != 0) {
+        size_t unread = stream->buffer_length - stream->buffer_position;
+        if (unread > (uintmax_t)logical_position) {
+            errno = EOVERFLOW;
+            stream->flags |= STREAM_ERROR;
+            return -1L;
+        }
+        logical_position -= (intmax_t)unread;
+    } else if ((stream->flags & STREAM_LAST_WRITE) != 0) {
+        if (stream->buffer_length > (uintmax_t)(INTMAX_MAX - logical_position)) {
+            errno = EOVERFLOW;
+            stream->flags |= STREAM_ERROR;
+            return -1L;
+        }
+        logical_position += (intmax_t)stream->buffer_length;
+    }
+    if (logical_position > LONG_MAX || logical_position < LONG_MIN) {
+        errno = EOVERFLOW;
+        stream->flags |= STREAM_ERROR;
+        return -1L;
+    }
+    return (long)logical_position;
+}
+
+void rewind(FILE *stream)
+{
+    if (stream_active(stream)) {
+        fseek(stream, 0, SEEK_SET);
+        stream->flags &= ~(STREAM_EOF | STREAM_ERROR);
+    } else {
+        errno = EBADF;
+    }
 }
 
 size_t fread(void *buffer, size_t size, size_t count, FILE *stream)
@@ -417,6 +489,144 @@ int fputc(int character, FILE *stream)
     return (unsigned char)character;
 }
 
+static inline size_t newline_offset(const unsigned char *buffer, size_t length)
+{
+    const size_t ones = SIZE_MAX / UCHAR_MAX;
+    const size_t high_bits = ones * (UCHAR_MAX / 2U + 1U);
+    const size_t newlines = ones * (size_t)'\n';
+    size_t offset = 0;
+
+    while (length - offset >= sizeof(size_t)) {
+        size_t word;
+        __builtin_memcpy(&word, buffer + offset, sizeof(word));
+        size_t different = word ^ newlines;
+        if (((different - ones) & ~different & high_bits) != 0) {
+            break;
+        }
+        offset += sizeof(size_t);
+    }
+    while (offset < length && buffer[offset] != '\n') {
+        offset++;
+    }
+    return offset;
+}
+
+char *fgets(char *buffer, int count, FILE *stream)
+{
+    if (buffer == NULL || !stream_active(stream) ||
+        (stream->flags & STREAM_READ) == 0) {
+        errno = EINVAL;
+        if (stream_active(stream)) stream->flags |= STREAM_ERROR;
+        return NULL;
+    }
+    if (count <= 0) {
+        errno = EINVAL;
+        stream->flags |= STREAM_ERROR;
+        return NULL;
+    }
+    if (count == 1) {
+        buffer[0] = '\0';
+        return buffer;
+    }
+    if ((stream->flags & STREAM_LAST_WRITE) != 0 && fflush(stream) == EOF) {
+        return NULL;
+    }
+    if ((stream->flags & STREAM_LAST_READ) == 0) {
+        stream->flags = (stream->flags & ~STREAM_LAST_WRITE) | STREAM_LAST_READ;
+    }
+
+    size_t length = 0;
+    size_t limit = (size_t)(count - 1);
+    while (length < limit) {
+        if (stream->buffer_position == stream->buffer_length) {
+            ssize_t result;
+            do {
+                result = read(stream->file_descriptor, stream->buffer, BUFSIZ);
+            } while (result < 0 && errno == EINTR);
+            if (result < 0) {
+                stream->flags |= STREAM_ERROR;
+                if (length == 0) {
+                    return NULL;
+                }
+                break;
+            }
+            if (result == 0) {
+                stream->flags |= STREAM_EOF;
+                if (length == 0) {
+                    return NULL;
+                }
+                break;
+            }
+            stream->buffer_length = (size_t)result;
+            stream->buffer_position = 0;
+        }
+
+        size_t available = stream->buffer_length - stream->buffer_position;
+        size_t chunk = limit - length < available ? limit - length : available;
+        size_t scanned = newline_offset(stream->buffer + stream->buffer_position, chunk);
+        if (scanned < chunk) {
+            scanned++;
+        }
+        memcpy(buffer + length, stream->buffer + stream->buffer_position, scanned);
+        stream->buffer_position += scanned;
+        length += scanned;
+        if (stream->buffer[stream->buffer_position - 1] == '\n') {
+            break;
+        }
+    }
+    buffer[length] = '\0';
+    return buffer;
+}
+
+int fputs(const char *string, FILE *stream)
+{
+    if (string == NULL || !stream_active(stream) ||
+        (stream->flags & STREAM_WRITE) == 0) {
+        errno = EINVAL;
+        if (stream_active(stream)) stream->flags |= STREAM_ERROR;
+        return EOF;
+    }
+    size_t length = strlen(string);
+    if ((stream->flags & (STREAM_UNBUFFERED | STREAM_LAST_READ)) == 0 &&
+        BUFSIZ - stream->buffer_length >= length) {
+        if ((stream->flags & STREAM_LAST_WRITE) == 0) {
+            stream->flags |= STREAM_LAST_WRITE;
+        }
+        memcpy(stream->buffer + stream->buffer_length, string, length);
+        stream->buffer_length += length;
+        return 0;
+    }
+    return fwrite(string, 1, length, stream) == length ? 0 : EOF;
+}
+
+int puts(const char *string)
+{
+    if (string == NULL || !stream_active(stdout) ||
+        (stdout->flags & STREAM_WRITE) == 0) {
+        errno = EINVAL;
+        if (stream_active(stdout)) stdout->flags |= STREAM_ERROR;
+        return EOF;
+    }
+    size_t length = strlen(string);
+    if ((stdout->flags & STREAM_LAST_READ) != 0 && synchronize_input(stdout) != 0) {
+        return EOF;
+    }
+    if ((stdout->flags & STREAM_LAST_WRITE) == 0) {
+        stdout->flags = (stdout->flags & ~STREAM_LAST_READ) | STREAM_LAST_WRITE;
+    }
+    if ((stdout->flags & STREAM_UNBUFFERED) == 0 &&
+        BUFSIZ - stdout->buffer_length > length) {
+        memcpy(stdout->buffer + stdout->buffer_length, string, length);
+        stdout->buffer[stdout->buffer_length + length] = '\n';
+        stdout->buffer_length += length + 1;
+        return 0;
+    }
+    if (fwrite(string, 1, length, stdout) != length || fputc('\n', stdout) == EOF) {
+        return EOF;
+    }
+    return 0;
+}
+
 int feof(FILE *stream)
 {
     return stream_active(stream) && (stream->flags & STREAM_EOF) != 0;
@@ -566,7 +776,7 @@ static inline void emit_repeat(struct format_output *output, char character, siz
 static inline void emit_buffer_string(struct format_output *output, const char *string,
     size_t length)
 {
-    if (output->failed) {
+    if (output->failed || length == 0) {
         return;
     }
     if (length > (size_t)INT_MAX - output->length) {
@@ -574,11 +784,34 @@ static inline void emit_buffer_string(struct format_output *output, const char *
         output->failed = 1;
         return;
     }
-    if (output->capacity != 0 && output->length < output->capacity - 1) {
-        size_t available = output->capacity - 1 - output->length;
-        size_t stored = length < available ? length : available;
-        for (size_t index = 0; index < stored; index++) {
-            output->destination[output->length + index] = string[index];
+    if (output->to_buffer) {
+        if (output->capacity != 0 && output->length < output->capacity - 1) {
+            size_t available = output->capacity - 1 - output->length;
+            size_t stored = length < available ? length : available;
+            if (stored == 1) {
+                output->destination[output->length] = string[0];
+            } else {
+                memcpy(output->destination + output->length, string, stored);
+            }
+        }
+    } else {
+        if (length == 1 && output->pending_length < sizeof(output->pending)) {
+            output->pending[output->pending_length++] = string[0];
+        } else if (output->pending_length + length <= sizeof(output->pending)) {
+            memcpy(output->pending + output->pending_length, string, length);
+            output->pending_length += length;
+        } else {
+            if (output->pending_length != 0 && flush_output(output) != 0) {
+                return;
+            }
+            if (length <= sizeof(output->pending)) {
+                memcpy(output->pending, string, length);
+                output->pending_length = length;
+            } else if (fwrite(string, 1, length, output->stream) != length ||
+                ferror(output->stream)) {
+                output->failed = 1;
+                return;
+            }
         }
     }
     output->length += length;
@@ -586,10 +819,12 @@ static inline void emit_buffer_string(struct format_output *output, const char *
 
 static inline size_t string_length(const char *string, int precision, int precision_set)
 {
+    if (!precision_set) {
+        return strlen(string);
+    }
     size_t length = 0;
 
-    while ((!precision_set || length < (size_t)precision) &&
-        string[length] != '\0') {
+    while (length < (size_t)precision && string[length] != '\0') {
         length++;
     }
     return length;
@@ -601,15 +836,11 @@ static inline void emit_string_field(struct format_output *output, const char *s
     size_t length = string_length(string, precision, precision_set);
     size_t padding = width > 0 && (size_t)width > length ? (size_t)width - length : 0;
 
-    if (!left) {
+    if (padding != 0 && !left) {
         emit_repeat(output, ' ', padding);
     }
-    if (output->to_buffer) {
-        emit_buffer_string(output, string, length);
-    } else for (size_t index = 0; index < length && !output->failed; index++) {
-        emit_character(output, string[index]);
-    }
-    if (left) {
+    emit_buffer_string(output, string, length);
+    if (padding != 0 && left) {
         emit_repeat(output, ' ', padding);
     }
 }
@@ -662,31 +893,49 @@ static void emit_integer(struct format_output *output, uintmax_t value,
     int negative, unsigned int base, int uppercase, int width, int precision,
     int precision_set, int left, int zero, int alternate, int plus, int space)
 {
-    char digits[sizeof(value) * CHAR_BIT];
+    char buf[80];
+    char *end = buf + sizeof(buf);
+    char *cursor = end;
     const char *alphabet = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
-    size_t digit_count = 0;
     char sign = '\0';
     char prefix[2];
     size_t prefix_length = 0;
 
     if (base == 10) {
-        do {
-            digits[digit_count++] = alphabet[value % 10U];
-            value /= 10U;
-        } while (value != 0);
+        static const char two_digits[201] =
+            "0001020304050607080910111213141516171819"
+            "2021222324252627282930313233343536373839"
+            "4041424344454647484950515253545556575859"
+            "6061626364656667686970717273747576777879"
+            "8081828384858687888990919293949596979899";
+        while (value >= 100U) {
+            unsigned int rem = (unsigned int)(value % 100U);
+            value /= 100U;
+            *--cursor = two_digits[rem * 2U + 1U];
+            *--cursor = two_digits[rem * 2U];
+        }
+        if (value >= 10U) {
+            unsigned int rem = (unsigned int)value;
+            *--cursor = two_digits[rem * 2U + 1U];
+            *--cursor = two_digits[rem * 2U];
+        } else {
+            *--cursor = (char)('0' + value);
+        }
     } else if (base == 16) {
         do {
-            digits[digit_count++] = alphabet[value & 15U];
+            *--cursor = alphabet[value & 15U];
             value >>= 4;
         } while (value != 0);
     } else {
         do {
-            digits[digit_count++] = alphabet[value & 7U];
+            *--cursor = alphabet[value & 7U];
             value >>= 3;
         } while (value != 0);
     }
 
-    if (precision_set && precision == 0 && digit_count == 1 && digits[0] == '0') {
+    size_t digit_count = (size_t)(end - cursor);
+    if (precision_set && precision == 0 && digit_count == 1 && *cursor == '0') {
+        cursor = end;
         digit_count = 0;
     }
     if (negative) {
@@ -701,7 +950,7 @@ static void emit_integer(struct format_output *output, uintmax_t value,
         prefix[1] = uppercase ? 'X' : 'x';
         prefix_length = 2;
     } else if (alternate && base == 8 &&
-        (digit_count == 0 || digits[digit_count - 1] != '0') &&
+        (digit_count == 0 || *cursor != '0') &&
         (!precision_set || (size_t)precision <= digit_count)) {
         prefix[0] = '0';
         prefix_length = 1;
@@ -713,24 +962,35 @@ static void emit_integer(struct format_output *output, uintmax_t value,
     size_t padding = width > 0 && (size_t)width > content_length
         ? (size_t)width - content_length : 0;
     int width_zeroes = zero && !left && !precision_set;
+    size_t total_zeroes = zero_count + (width_zeroes ? padding : 0);
 
-    if (!left && !width_zeroes) {
+    if (!left && !width_zeroes && padding != 0) {
         emit_repeat(output, ' ', padding);
     }
-    if (sign != '\0') {
-        emit_character(output, sign);
+    if (total_zeroes <= (size_t)(cursor - buf) - 3U) {
+        while (total_zeroes-- != 0) {
+            *--cursor = '0';
+        }
+        while (prefix_length != 0) {
+            *--cursor = prefix[--prefix_length];
+        }
+        if (sign != '\0') {
+            *--cursor = sign;
+        }
+        emit_buffer_string(output, cursor, (size_t)(end - cursor));
+    } else {
+        if (sign != '\0') {
+            emit_character(output, sign);
+        }
+        for (size_t index = 0; index < prefix_length; index++) {
+            emit_character(output, prefix[index]);
+        }
+        if (total_zeroes != 0) {
+            emit_repeat(output, '0', total_zeroes);
+        }
+        emit_buffer_string(output, cursor, digit_count);
     }
-    for (size_t index = 0; index < prefix_length; index++) {
-        emit_character(output, prefix[index]);
-    }
-    if (width_zeroes) {
-        emit_repeat(output, '0', padding);
-    }
-    emit_repeat(output, '0', zero_count);
-    while (digit_count != 0) {
-        emit_character(output, digits[--digit_count]);
-    }
-    if (left) {
+    if (left && padding != 0) {
         emit_repeat(output, ' ', padding);
     }
 }
@@ -740,7 +1000,15 @@ static int render_format(struct format_output *output, const char *format,
 {
     while (*format != '\0' && !output->failed) {
         if (*format != '%') {
-            emit_character(output, *format++);
+            if (format[1] == '%' || format[1] == '\0') {
+                emit_character(output, *format++);
+                continue;
+            }
+            const char *literal_start = format;
+            do {
+                format++;
+            } while (*format != '\0' && *format != '%');
+            emit_buffer_string(output, literal_start, (size_t)(format - literal_start));
             continue;
         }
         format++;
@@ -895,11 +1163,16 @@ int vsnprintf(char *buffer, size_t size, const char *format, va_list arguments)
         errno = EINVAL;
         return -1;
     }
-    struct format_output output = {
-        .destination = buffer,
-        .capacity = size,
-        .to_buffer = 1
-    };
+    struct format_output output;
+    output.destination = buffer;
+    output.capacity = size;
+    output.length = 0;
+    output.pending_length = 0;
+    output.stream = NULL;
+    output.file_descriptor = -1;
+    output.to_buffer = 1;
+    output.to_stream = 0;
+    output.failed = 0;
     va_list copied_arguments;
     va_copy(copied_arguments, arguments);
     render_format(&output, format, &copied_arguments);
@@ -929,7 +1202,16 @@ int vfprintf(FILE *stream, const char *format, va_list arguments)
     if ((stream->flags & STREAM_LAST_WRITE) == 0) {
         stream->flags = (stream->flags & ~STREAM_LAST_READ) | STREAM_LAST_WRITE;
     }
-    struct format_output output = { .stream = stream, .to_stream = 1 };
+    struct format_output output;
+    output.destination = NULL;
+    output.capacity = 0;
+    output.length = 0;
+    output.pending_length = 0;
+    output.stream = stream;
+    output.file_descriptor = -1;
+    output.to_buffer = 0;
+    output.to_stream = 1;
+    output.failed = 0;
     va_list copied_arguments;
     va_copy(copied_arguments, arguments);
     render_format(&output, format, &copied_arguments);
