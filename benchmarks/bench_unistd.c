@@ -1,26 +1,71 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "bench_common.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define IO_ITERATIONS 2000U
+#define TIME_ITERATIONS 1000000U
 #define CLOSE_ITERATIONS 128U
 
 extern ssize_t iris_read(int file_descriptor, void *buffer, size_t count);
 extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
 extern int iris_close(int file_descriptor);
+extern int iris_open(const char *path, int flags, ...);
+extern off_t iris_lseek(int file_descriptor, off_t offset, int whence);
+extern int iris_ftruncate(int file_descriptor, off_t length);
+extern int iris_ioctl(int file_descriptor, unsigned long request, ...);
+extern time_t iris_time(time_t *timer);
+extern time_t (*__iris_time_dispatch)(time_t *timer);
+extern time_t __iris_time_syscall(time_t *timer);
+extern int __iris_init_vdso(uintptr_t image_address);
+typedef void (*iris_signal_handler)(int);
+extern iris_signal_handler iris_signal(int signal_number,
+    iris_signal_handler handler);
 extern pid_t iris_getpid(void);
 extern void *iris_mmap(void *address, size_t length, int protection, int flags,
     int file_descriptor, off_t offset);
 extern int iris_munmap(void *address, size_t length);
+extern int iris_mprotect(void *address, size_t length, int protection);
+struct iris_termios {
+    unsigned int c_iflag;
+    unsigned int c_oflag;
+    unsigned int c_cflag;
+    unsigned int c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[19];
+};
+extern int iris_tcgetattr(int file_descriptor, struct iris_termios *settings);
+extern int iris_tcsetattr(int file_descriptor, int action,
+    const struct iris_termios *settings);
+extern int iris_isatty(int file_descriptor);
 
 typedef ssize_t (*read_function)(int, void *, size_t);
 typedef ssize_t (*write_function)(int, const void *, size_t);
 typedef int (*close_function)(int);
+typedef int (*open_function)(const char *, int, ...);
+typedef off_t (*lseek_function)(int, off_t, int);
+typedef int (*ftruncate_function)(int, off_t);
+typedef int (*ioctl_function)(int, unsigned long, ...);
+typedef time_t (*time_function)(time_t *);
+typedef int (*mprotect_function)(void *, size_t, int);
+typedef int (*isatty_function)(int);
+typedef int (*tcgetattr_function)(int, void *);
+typedef int (*tcsetattr_function)(int, int, const void *);
+typedef void (*signal_handler)(int);
+typedef signal_handler (*signal_function)(int, signal_handler);
 typedef pid_t (*getpid_function)(void);
 typedef void *(*mmap_function)(void *, size_t, int, int, int, off_t);
 typedef int (*munmap_function)(void *, size_t);
@@ -36,6 +81,7 @@ typedef double (*io_timer_function)(size_t, size_t, io_benchmark_function, int);
 
 static volatile size_t benchmark_sink;
 static unsigned char io_buffer[4096];
+static int benchmark_file_descriptor = -1;
 
 static double time_read(size_t size, size_t iterations,
     io_benchmark_function opaque_function, int file_descriptor)
@@ -51,6 +97,25 @@ static double time_read(size_t size, size_t iterations,
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     benchmark_sink += (size_t)result;
+
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_read_error(size_t size, size_t iterations,
+    io_benchmark_function opaque_function, int unused_file_descriptor)
+{
+    read_function function = opaque_function.read;
+    struct timespec start;
+    struct timespec end;
+
+    (void)unused_file_descriptor;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        errno = 0;
+        ssize_t result = function(-1, io_buffer, size);
+        benchmark_sink += (size_t)(result == -1 && errno == EBADF);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
 
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
@@ -141,6 +206,386 @@ static double time_mmap_pair(size_t size, size_t iterations,
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
+static double time_mprotect_pair(size_t size, size_t iterations,
+    mmap_function map_fn, mprotect_function protect_fn,
+    munmap_function unmap_fn)
+{
+    struct timespec start;
+    struct timespec end;
+    void *mapping = map_fn(NULL, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        return 0.0;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        benchmark_sink += (size_t)(protect_fn(mapping, size, PROT_READ) + 1);
+        benchmark_sink += (size_t)(protect_fn(mapping, size,
+            PROT_READ | PROT_WRITE) + 1);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    unmap_fn(mapping, size);
+    return elapsed_nanoseconds(start, end) / (double)(iterations * 2U);
+}
+
+static double time_open_close(size_t iterations, open_function open_fn,
+    close_function close_fn)
+{
+    struct timespec start;
+    struct timespec end;
+    size_t completed = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        int descriptor = open_fn("/dev/null", O_RDONLY);
+        if (descriptor >= 0) {
+            close_fn(descriptor);
+            completed++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += completed;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_lseek(size_t iterations, lseek_function function,
+    int file_descriptor)
+{
+    struct timespec start;
+    struct timespec end;
+    off_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function(file_descriptor, 0, SEEK_SET);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_ftruncate(size_t iterations, ftruncate_function function,
+    int file_descriptor)
+{
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        off_t length = (index & 1U) == 0 ? 4096 : 0;
+        result += function(file_descriptor, length);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result + 1);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_ioctl_error(size_t iterations, ioctl_function function)
+{
+    struct timespec start;
+    struct timespec end;
+    struct winsize window_size;
+    size_t errors = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        errors += function(-1, TIOCGWINSZ, &window_size) == -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += errors;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_time(size_t iterations, time_function function)
+{
+    struct timespec start;
+    struct timespec end;
+    time_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function(NULL);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_signal(size_t iterations, signal_function function)
+{
+    struct timespec start;
+    struct timespec end;
+    size_t errors = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        errors += function(SIGWINCH, SIG_IGN) == SIG_ERR;
+        errors += function(SIGWINCH, SIG_DFL) == SIG_ERR;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += errors;
+    return elapsed_nanoseconds(start, end) / (double)(iterations * 2U);
+}
+
+static double time_isatty(size_t iterations, isatty_function function)
+{
+    struct timespec start;
+    struct timespec end;
+    size_t results = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        results += (size_t)function(-1);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += results;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static int host_tcgetattr_call(int file_descriptor, void *settings)
+{
+    return tcgetattr(file_descriptor, settings);
+}
+
+static int iris_tcgetattr_call(int file_descriptor, void *settings)
+{
+    return iris_tcgetattr(file_descriptor, settings);
+}
+
+static int host_tcsetattr_call(int file_descriptor, int action,
+    const void *settings)
+{
+    return tcsetattr(file_descriptor, action, settings);
+}
+
+static int iris_tcsetattr_call(int file_descriptor, int action,
+    const void *settings)
+{
+    return iris_tcsetattr(file_descriptor, action, settings);
+}
+
+static double time_tcgetattr(size_t iterations, tcgetattr_function function,
+    void *settings)
+{
+    struct timespec start;
+    struct timespec end;
+    size_t errors = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        errors += function(-1, settings) == -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += errors;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_tcsetattr(size_t iterations, tcsetattr_function function,
+    const void *settings)
+{
+    struct timespec start;
+    struct timespec end;
+    size_t errors = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        errors += function(-1, TCSANOW, settings) == -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += errors;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_tcgetattr(size_t iterations);
+static double time_iris_tcgetattr(size_t iterations);
+static double time_host_tcsetattr(size_t iterations);
+static double time_iris_tcsetattr(size_t iterations);
+
+static double time_host_open_close(size_t iterations)
+{
+    return time_open_close(iterations, open, close);
+}
+
+static double time_iris_open_close(size_t iterations)
+{
+    return time_open_close(iterations, iris_open, iris_close);
+}
+
+static double time_host_lseek(size_t iterations)
+{
+    return time_lseek(iterations, lseek, benchmark_file_descriptor);
+}
+
+static double time_iris_lseek(size_t iterations)
+{
+    return time_lseek(iterations, iris_lseek, benchmark_file_descriptor);
+}
+
+static double time_host_ftruncate(size_t iterations)
+{
+    return time_ftruncate(iterations, ftruncate, benchmark_file_descriptor);
+}
+
+static double time_iris_ftruncate(size_t iterations)
+{
+    return time_ftruncate(iterations, iris_ftruncate, benchmark_file_descriptor);
+}
+
+static double time_host_ioctl(size_t iterations)
+{
+    return time_ioctl_error(iterations, ioctl);
+}
+
+static double time_iris_ioctl(size_t iterations)
+{
+    return time_ioctl_error(iterations, iris_ioctl);
+}
+
+static double time_host_time(size_t iterations)
+{
+    return time_time(iterations, time);
+}
+
+static double time_iris_time_inline(size_t iterations)
+{
+    return time_time(iterations, __iris_time_dispatch);
+}
+
+#define DEFINE_DIRECT_TIME_BENCH(name, function) \
+    static double time_##name(size_t iterations) \
+    { \
+        struct timespec start; \
+        struct timespec end; \
+        time_t result = 0; \
+        clock_gettime(CLOCK_MONOTONIC, &start); \
+        for (size_t index = 0; index < iterations; index++) { \
+            result += function(NULL); \
+        } \
+        clock_gettime(CLOCK_MONOTONIC, &end); \
+        benchmark_sink += (size_t)result; \
+        return elapsed_nanoseconds(start, end) / (double)iterations; \
+    }
+
+DEFINE_DIRECT_TIME_BENCH(host_time_symbol, time)
+DEFINE_DIRECT_TIME_BENCH(iris_time_symbol, iris_time)
+
+#undef DEFINE_DIRECT_TIME_BENCH
+
+static time_t host_time_syscall(time_t *timer)
+{
+    return (time_t)syscall(SYS_time, timer);
+}
+
+static double time_host_time_syscall(size_t iterations)
+{
+    return time_time(iterations, host_time_syscall);
+}
+
+static double time_iris_time_syscall(size_t iterations)
+{
+    return time_time(iterations, __iris_time_syscall);
+}
+
+static double time_host_signal(size_t iterations)
+{
+    return time_signal(iterations, signal);
+}
+
+static double time_iris_signal(size_t iterations)
+{
+    return time_signal(iterations, iris_signal);
+}
+
+static double time_host_isatty(size_t iterations)
+{
+    return time_isatty(iterations, isatty);
+}
+
+static double time_iris_isatty(size_t iterations)
+{
+    return time_isatty(iterations, iris_isatty);
+}
+
+static double time_host_mprotect(size_t iterations)
+{
+    return time_mprotect_pair(4096, iterations, mmap, mprotect, munmap);
+}
+
+static double time_iris_mprotect(size_t iterations)
+{
+    return time_mprotect_pair(4096, iterations, iris_mmap, iris_mprotect,
+        iris_munmap);
+}
+
+static double time_host_tcgetattr_bench(size_t iterations)
+{
+    return time_host_tcgetattr(iterations);
+}
+
+static double time_iris_tcgetattr_bench(size_t iterations)
+{
+    return time_iris_tcgetattr(iterations);
+}
+
+static double time_host_tcsetattr_bench(size_t iterations)
+{
+    return time_host_tcsetattr(iterations);
+}
+
+static double time_iris_tcsetattr_bench(size_t iterations)
+{
+    return time_iris_tcsetattr(iterations);
+}
+
+static void report_simple(const char *label, size_t iterations,
+    double (*host_function)(size_t), double (*iris_function)(size_t))
+{
+    double host_samples[TRIALS];
+    double iris_samples[TRIALS];
+
+    for (size_t trial = 0; trial < TRIALS; trial++) {
+        if ((trial & 1U) == 0) {
+            host_samples[trial] = host_function(iterations);
+            iris_samples[trial] = iris_function(iterations);
+        } else {
+            iris_samples[trial] = iris_function(iterations);
+            host_samples[trial] = host_function(iterations);
+        }
+    }
+
+    double host_median = median(host_samples);
+    double iris_median = median(iris_samples);
+    printf("| %-8s | %8zu | %16.2f | %16.2f | %15.2fx |\n", label,
+        (size_t)0, host_median, iris_median,
+        iris_median > 0.0 ? host_median / iris_median : 0.0);
+}
+
+static double time_host_tcgetattr(size_t iterations)
+{
+    struct termios settings;
+    return time_tcgetattr(iterations, host_tcgetattr_call, &settings);
+}
+
+static double time_iris_tcgetattr(size_t iterations)
+{
+    struct iris_termios settings;
+    return time_tcgetattr(iterations, iris_tcgetattr_call, &settings);
+}
+
+static double time_host_tcsetattr(size_t iterations)
+{
+    struct termios settings = { 0 };
+    return time_tcsetattr(iterations, host_tcsetattr_call, &settings);
+}
+
+static double time_iris_tcsetattr(size_t iterations)
+{
+    struct iris_termios settings = { 0 };
+    return time_tcsetattr(iterations, iris_tcsetattr_call, &settings);
+}
+
 static void report_io(const char *label, size_t size, size_t iterations,
     io_timer_function timer, io_benchmark_function system_function,
     io_benchmark_function iris_function, int file_descriptor)
@@ -169,15 +614,30 @@ int main(void)
 {
     int read_descriptor = open("/dev/zero", O_RDONLY);
     int write_descriptor = open("/dev/null", O_WRONLY);
+    char temporary_path[] = "/tmp/iris-unistd-bench-XXXXXX";
+    benchmark_file_descriptor = mkstemp(temporary_path);
 
-    if (read_descriptor < 0 || write_descriptor < 0) {
+    if (read_descriptor < 0 || write_descriptor < 0 ||
+        benchmark_file_descriptor < 0) {
         if (read_descriptor >= 0) close(read_descriptor);
         if (write_descriptor >= 0) close(write_descriptor);
+        if (benchmark_file_descriptor >= 0) close(benchmark_file_descriptor);
+        return 1;
+    }
+    unlink(temporary_path);
+    if (ftruncate(benchmark_file_descriptor, 4096) != 0) {
+        close(read_descriptor);
+        close(write_descriptor);
+        close(benchmark_file_descriptor);
         return 1;
     }
 
     printf("Linux syscalls vs %s; median of %d trials\n",
         BENCH_LIBC_NAME, TRIALS);
+    if (__iris_init_vdso((uintptr_t)getauxval(AT_SYSINFO_EHDR)) != 0) {
+        fprintf(stderr, "VDSO time unavailable; Iris time() will use syscall fallback\n");
+    }
+    puts("time-libc measures the header fast path; time-symbol measures the ABI wrapper; time-syscall compares direct syscalls");
     puts("+----------+----------+------------------+------------------+------------------+");
     printf("| %-8s | %-8s | %-16s | %-16s | %-16s |\n",
         "Function", "Size (B)", "libc ns/op", "Iris ns/op", "speedup");
@@ -190,12 +650,36 @@ int main(void)
             (io_benchmark_function){ .write = write },
             (io_benchmark_function){ .write = iris_write }, write_descriptor);
     }
+    report_io("readerr", sizeof(io_buffer), IO_ITERATIONS, time_read_error,
+        (io_benchmark_function){ .read = read },
+        (io_benchmark_function){ .read = iris_read }, -1);
     report_io("close", 0, CLOSE_ITERATIONS, time_close,
         (io_benchmark_function){ .close = close },
         (io_benchmark_function){ .close = iris_close }, -1);
     report_io("getpid", 0, IO_ITERATIONS, time_getpid,
         (io_benchmark_function){ .getpid = getpid },
         (io_benchmark_function){ .getpid = iris_getpid }, 0);
+    report_simple("open+close", IO_ITERATIONS,
+        time_host_open_close, time_iris_open_close);
+    report_simple("lseek", IO_ITERATIONS, time_host_lseek, time_iris_lseek);
+    report_simple("ftruncate", IO_ITERATIONS,
+        time_host_ftruncate, time_iris_ftruncate);
+    report_simple("ioctl-EBADF", IO_ITERATIONS,
+        time_host_ioctl, time_iris_ioctl);
+    report_simple("time-libc", TIME_ITERATIONS,
+        time_host_time, time_iris_time_inline);
+    report_simple("time-symbol", TIME_ITERATIONS,
+        time_host_time_symbol, time_iris_time_symbol);
+    report_simple("time-syscall", TIME_ITERATIONS,
+        time_host_time_syscall, time_iris_time_syscall);
+    report_simple("signal", IO_ITERATIONS, time_host_signal, time_iris_signal);
+    report_simple("isatty", IO_ITERATIONS, time_host_isatty, time_iris_isatty);
+    report_simple("tcgetattr", IO_ITERATIONS,
+        time_host_tcgetattr_bench, time_iris_tcgetattr_bench);
+    report_simple("tcsetattr", IO_ITERATIONS,
+        time_host_tcsetattr_bench, time_iris_tcsetattr_bench);
+    report_simple("mprotect", CLOSE_ITERATIONS,
+        time_host_mprotect, time_iris_mprotect);
     {
         double host_samples[TRIALS];
         double iris_samples[TRIALS];
@@ -216,6 +700,7 @@ int main(void)
     }
     close(read_descriptor);
     close(write_descriptor);
+    close(benchmark_file_descriptor);
     puts("+----------+----------+------------------+------------------+------------------+");
     fprintf(stderr, "unistd benchmark checksum: %zu\n", benchmark_sink);
     return 0;

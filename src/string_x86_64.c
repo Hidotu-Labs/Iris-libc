@@ -451,17 +451,24 @@ static int detect_avx512(void)
         ((1U << 16) | (1U << 30) | (1U << 31));
 }
 
+static atomic_int cached_avx512_support = ATOMIC_VAR_INIT(-1);
+
 static inline int cpu_has_avx512(void)
 {
-    static atomic_int cached_support = ATOMIC_VAR_INIT(-1);
-    int supported = atomic_load_explicit(&cached_support, memory_order_relaxed);
+    int supported = atomic_load_explicit(&cached_avx512_support, memory_order_relaxed);
 
     if (__builtin_expect(supported < 0, 0)) {
         supported = detect_avx512();
-        atomic_store_explicit(&cached_support, supported, memory_order_relaxed);
+        atomic_store_explicit(&cached_avx512_support, supported, memory_order_relaxed);
     }
 
     return supported;
+}
+
+/* Hot-path check: false until cpu_has_avx512() has run once. */
+static inline int cpu_avx512_known(void)
+{
+    return atomic_load_explicit(&cached_avx512_support, memory_order_relaxed) > 0;
 }
 
 
@@ -530,8 +537,18 @@ static void *copy_avx512(unsigned char *output, const unsigned char *input, size
         return output;
     }
 
+    /*
+     * The final 256 bytes are loaded before anything is stored and written
+     * last, overlapping the loop's output. Loading them first keeps forward
+     * overlapping moves (memmove with output < input) correct.
+     */
+    __m512i tail0 = _mm512_loadu_si512((const void *)(input + count - 256));
+    __m512i tail1 = _mm512_loadu_si512((const void *)(input + count - 192));
+    __m512i tail2 = _mm512_loadu_si512((const void *)(input + count - 128));
+    __m512i tail3 = _mm512_loadu_si512((const void *)(input + count - 64));
     size_t index = 0;
-    for (; count - index >= 256; index += 256) {
+
+    for (; count - index > 256; index += 256) {
         __m512i first = _mm512_loadu_si512((const void *)(input + index));
         __m512i second = _mm512_loadu_si512((const void *)(input + index + 64));
         __m512i third = _mm512_loadu_si512((const void *)(input + index + 128));
@@ -541,9 +558,10 @@ static void *copy_avx512(unsigned char *output, const unsigned char *input, size
         _mm512_storeu_si512((void *)(output + index + 128), third);
         _mm512_storeu_si512((void *)(output + index + 192), fourth);
     }
-    if (index < count) {
-        copy_avx512(output + index, input + index, count - index);
-    }
+    _mm512_storeu_si512((void *)(output + count - 256), tail0);
+    _mm512_storeu_si512((void *)(output + count - 192), tail1);
+    _mm512_storeu_si512((void *)(output + count - 128), tail2);
+    _mm512_storeu_si512((void *)(output + count - 64), tail3);
 
     return output;
 }
@@ -681,6 +699,22 @@ static void *move_avx512(unsigned char *output, const unsigned char *input, size
     return output;
 }
 
+/* 65..256 bytes as straight-line code; kept separate so memset reaches it with few branches. */
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+static void *set_medium_avx512(void *destination, int value, size_t count)
+{
+    unsigned char *output = destination;
+    __m512i pattern = _mm512_set1_epi8((char)value);
+
+    _mm512_storeu_si512((void *)output, pattern);
+    _mm512_storeu_si512((void *)(output + count - 64), pattern);
+    if (count > 128) {
+        _mm512_storeu_si512((void *)(output + 64), pattern);
+        _mm512_storeu_si512((void *)(output + count - 128), pattern);
+    }
+    return destination;
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static void *set_avx512(void *destination, int value, size_t count)
 {
@@ -714,14 +748,6 @@ static void *set_avx512(void *destination, int value, size_t count)
         return destination;
     }
 
-    if (count <= 256) {
-        _mm512_storeu_si512((void *)output, pattern);
-        _mm512_storeu_si512((void *)(output + 64), pattern);
-        _mm512_storeu_si512((void *)(output + count - 128), pattern);
-        _mm512_storeu_si512((void *)(output + count - 64), pattern);
-        return destination;
-    }
-
     if (count >= 262144) {
         __asm__ volatile(
             "rep stosb"
@@ -731,16 +757,19 @@ static void *set_avx512(void *destination, int value, size_t count)
         return destination;
     }
 
-    size_t index = 0;
-    for (; count - index >= 256; index += 256) {
-        _mm512_storeu_si512((void *)(output + index), pattern);
-        _mm512_storeu_si512((void *)(output + index + 64), pattern);
-        _mm512_storeu_si512((void *)(output + index + 128), pattern);
-        _mm512_storeu_si512((void *)(output + index + 192), pattern);
+    unsigned char *end = output + count;
+
+    for (; (size_t)(end - output) > 256; output += 256) {
+        _mm512_storeu_si512((void *)output, pattern);
+        _mm512_storeu_si512((void *)(output + 64), pattern);
+        _mm512_storeu_si512((void *)(output + 128), pattern);
+        _mm512_storeu_si512((void *)(output + 192), pattern);
     }
-    if (index < count) {
-        set_avx512(output + index, value, count - index);
-    }
+    /* The final 256 bytes overlap what the loop wrote; count > 256 keeps them in bounds. */
+    _mm512_storeu_si512((void *)(end - 256), pattern);
+    _mm512_storeu_si512((void *)(end - 192), pattern);
+    _mm512_storeu_si512((void *)(end - 128), pattern);
+    _mm512_storeu_si512((void *)(end - 64), pattern);
 
     return destination;
 }
@@ -992,154 +1021,103 @@ static int memcmp_short_avx512(const unsigned char *left,
     }
 }
 
+__attribute__((target("avx512f,avx512bw,avx512vl"), always_inline))
+static inline int memcmp_mismatch_avx512(const unsigned char *left,
+    const unsigned char *right, __m512i difference)
+{
+    size_t index = (size_t)__builtin_ctzll(
+        (uint64_t)_mm512_test_epi8_mask(difference, difference));
+
+    return (int)left[index] - (int)right[index];
+}
+
+/* count > 256 */
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static int memcmp_avx512(const unsigned char *left, const unsigned char *right, size_t count)
 {
-    if (count >= 64 && count <= 256) {
-        return memcmp_short_avx512(left, right, count);
-    }
-    while (count >= 128) {
-        __m512i left0 = _mm512_loadu_si512((const void *)left);
-        __m512i left1 = _mm512_loadu_si512((const void *)(left + 64));
-        __m512i right0 = _mm512_loadu_si512((const void *)right);
-        __m512i right1 = _mm512_loadu_si512((const void *)(right + 64));
-        __m512i difference0 = _mm512_xor_si512(left0, right0);
-        __m512i difference1 = _mm512_xor_si512(left1, right1);
-        __m512i difference = _mm512_ternarylogic_epi32(difference0, difference1, difference1, 0xfe);
-        uint64_t mismatch_mask = (uint64_t)_mm512_test_epi8_mask(difference, difference);
+    const unsigned char *left_last = left + count - 256;
+    const unsigned char *right_last = right + count - 256;
 
-        if (mismatch_mask != 0) {
-            uint64_t first_mask = (uint64_t)_mm512_test_epi8_mask(difference0, difference0);
-            size_t index;
-
-            if (first_mask != 0) {
-                index = (size_t)__builtin_ctzll(first_mask);
-            } else {
-                uint64_t second_mask = (uint64_t)_mm512_test_epi8_mask(difference1, difference1);
-                index = 64 + (size_t)__builtin_ctzll(second_mask);
-            }
-            return (int)left[index] - (int)right[index];
-        }
-        left += 128;
-        right += 128;
-        count -= 128;
-    }
-    if (count >= 64) {
-        __m512i difference = _mm512_xor_si512(
-            _mm512_loadu_si512((const void *)left),
+    for (; left < left_last; left += 256, right += 256) {
+        __m512i difference0 = _mm512_xor_si512(_mm512_loadu_si512((const void *)left),
             _mm512_loadu_si512((const void *)right));
-        uint64_t mismatch_mask = (uint64_t)_mm512_test_epi8_mask(difference, difference);
+        __m512i difference1 = _mm512_xor_si512(_mm512_loadu_si512((const void *)(left + 64)),
+            _mm512_loadu_si512((const void *)(right + 64)));
+        __m512i difference2 = _mm512_xor_si512(_mm512_loadu_si512((const void *)(left + 128)),
+            _mm512_loadu_si512((const void *)(right + 128)));
+        __m512i difference3 = _mm512_xor_si512(_mm512_loadu_si512((const void *)(left + 192)),
+            _mm512_loadu_si512((const void *)(right + 192)));
+        /* 0xfe: a | b | c */
+        __m512i combined = _mm512_ternarylogic_epi32(difference0, difference1, difference2, 0xfe);
 
-        if (mismatch_mask != 0) {
-            size_t index = (size_t)__builtin_ctzll(mismatch_mask);
-            return (int)left[index] - (int)right[index];
+        if (__builtin_expect(_mm512_test_epi8_mask(
+                _mm512_or_si512(combined, difference3), _mm512_or_si512(combined, difference3)) != 0, 0)) {
+            if (_mm512_test_epi8_mask(difference0, difference0) != 0) {
+                return memcmp_mismatch_avx512(left, right, difference0);
+            }
+            if (_mm512_test_epi8_mask(difference1, difference1) != 0) {
+                return memcmp_mismatch_avx512(left + 64, right + 64, difference1);
+            }
+            if (_mm512_test_epi8_mask(difference2, difference2) != 0) {
+                return memcmp_mismatch_avx512(left + 128, right + 128, difference2);
+            }
+            return memcmp_mismatch_avx512(left + 192, right + 192, difference3);
         }
-        left += 64;
-        right += 64;
-        count -= 64;
     }
-    if (count >= 32) {
-        __m256i difference = _mm256_xor_si256(
-            _mm256_loadu_si256((const __m256i *)left),
-            _mm256_loadu_si256((const __m256i *)right));
-        unsigned int mismatch_mask = (unsigned int)_mm256_test_epi8_mask(difference, difference);
-
-        if (mismatch_mask != 0) {
-            size_t index = (size_t)__builtin_ctz(mismatch_mask);
-            return (int)left[index] - (int)right[index];
-        }
-        left += 32;
-        right += 32;
-        count -= 32;
-    }
-    return compare_bytes(left, right, count);
+    /* The last 256 bytes overlap bytes already known to be equal. */
+    return memcmp_short_avx512(left_last, right_last, 256);
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static size_t strlen_avx512(const unsigned char *string)
 {
-    const unsigned char *cursor = string;
-    size_t room = 4096U - ((uintptr_t)cursor & 4095U);
+    /*
+     * Aligned loads never cross a page, so reading the bytes before `string`
+     * in its first chunk is safe; their bits are shifted out.
+     */
+    const unsigned char *cursor = (const unsigned char *)((uintptr_t)string & ~(uintptr_t)63);
+    __m512i chunk = _mm512_load_si512((const void *)cursor);
+    uint64_t zero_mask = (uint64_t)_mm512_testn_epi8_mask(chunk, chunk) >>
+        ((uintptr_t)string & 63U);
 
-    if (room >= 64) {
-        __m512i chunk = _mm512_loadu_si512((const void *)cursor);
-        uint64_t zero_mask = (uint64_t)_mm512_testn_epi8_mask(chunk, chunk);
-
+    if (zero_mask != 0) {
+        return (size_t)__builtin_ctzll(zero_mask);
+    }
+    for (cursor += 64; ((uintptr_t)cursor & 255U) != 0; cursor += 64) {
+        chunk = _mm512_load_si512((const void *)cursor);
+        zero_mask = (uint64_t)_mm512_testn_epi8_mask(chunk, chunk);
         if (zero_mask != 0) {
-            return (size_t)__builtin_ctzll(zero_mask);
-        }
-        cursor += 64;
-    }
-
-    for (;;) {
-        size_t page_room = 4096U - ((uintptr_t)cursor & 4095U);
-        while (page_room >= 256) {
-            __m512i first = _mm512_loadu_si512((const void *)cursor);
-            __m512i second = _mm512_loadu_si512((const void *)(cursor + 64));
-            __m512i third = _mm512_loadu_si512((const void *)(cursor + 128));
-            __m512i fourth = _mm512_loadu_si512((const void *)(cursor + 192));
-            __m512i minimum = _mm512_min_epu8(_mm512_min_epu8(first, second),
-                _mm512_min_epu8(third, fourth));
-
-            if ((uint64_t)_mm512_testn_epi8_mask(minimum, minimum) != 0) {
-                uint64_t zero_mask = (uint64_t)_mm512_testn_epi8_mask(first, first);
-                size_t offset = (size_t)(cursor - string);
-
-                if (zero_mask != 0) {
-                    return offset + (size_t)__builtin_ctzll(zero_mask);
-                }
-                zero_mask = (uint64_t)_mm512_testn_epi8_mask(second, second);
-                if (zero_mask != 0) {
-                    return offset + 64 + (size_t)__builtin_ctzll(zero_mask);
-                }
-                zero_mask = (uint64_t)_mm512_testn_epi8_mask(third, third);
-                if (zero_mask != 0) {
-                    return offset + 128 + (size_t)__builtin_ctzll(zero_mask);
-                }
-                zero_mask = (uint64_t)_mm512_testn_epi8_mask(fourth, fourth);
-                return offset + 192 + (size_t)__builtin_ctzll(zero_mask);
-            }
-            cursor += 256;
-            page_room -= 256;
-        }
-        if (page_room >= 64) {
-            __m512i chunk = _mm512_loadu_si512((const void *)cursor);
-            uint64_t zero_mask = (uint64_t)_mm512_testn_epi8_mask(chunk, chunk);
-
-            if (zero_mask != 0) {
-                return (size_t)(cursor - string) + (size_t)__builtin_ctzll(zero_mask);
-            }
-            cursor += 64;
-            continue;
-        }
-        if (page_room >= 32) {
-            __m256i chunk = _mm256_loadu_si256((const __m256i *)cursor);
-            unsigned int zero_mask = (unsigned int)_mm256_testn_epi8_mask(chunk, chunk);
-
-            if (zero_mask != 0) {
-                return (size_t)(cursor - string) + (size_t)__builtin_ctz(zero_mask);
-            }
-            cursor += 32;
-            continue;
-        }
-        if (page_room == 0) {
-            continue;
-        }
-        while (page_room > 0) {
-            if (*cursor == '\0') {
-                return (size_t)(cursor - string);
-            }
-            cursor++;
-            page_room--;
+            return (size_t)(cursor - string) + (size_t)__builtin_ctzll(zero_mask);
         }
     }
-}
+    /* 256-byte aligned blocks stay inside one page. */
+    for (;; cursor += 256) {
+        __m512i first = _mm512_load_si512((const void *)cursor);
+        __m512i second = _mm512_load_si512((const void *)(cursor + 64));
+        __m512i third = _mm512_load_si512((const void *)(cursor + 128));
+        __m512i fourth = _mm512_load_si512((const void *)(cursor + 192));
+        __m512i minimum = _mm512_min_epu8(_mm512_min_epu8(first, second),
+            _mm512_min_epu8(third, fourth));
 
-__attribute__((target("avx512f,avx512bw,avx512vl")))
-static unsigned int string_chunk_stop_mask_avx512(__m256i left, __m256i right)
-{
-    return (unsigned int)(~_mm256_cmpeq_epi8_mask(left, right)) |
-        (unsigned int)_mm256_testn_epi8_mask(left, left);
+        if ((uint64_t)_mm512_testn_epi8_mask(minimum, minimum) != 0) {
+            size_t offset = (size_t)(cursor - string);
+
+            zero_mask = (uint64_t)_mm512_testn_epi8_mask(first, first);
+            if (zero_mask != 0) {
+                return offset + (size_t)__builtin_ctzll(zero_mask);
+            }
+            zero_mask = (uint64_t)_mm512_testn_epi8_mask(second, second);
+            if (zero_mask != 0) {
+                return offset + 64 + (size_t)__builtin_ctzll(zero_mask);
+            }
+            zero_mask = (uint64_t)_mm512_testn_epi8_mask(third, third);
+            if (zero_mask != 0) {
+                return offset + 128 + (size_t)__builtin_ctzll(zero_mask);
+            }
+            zero_mask = (uint64_t)_mm512_testn_epi8_mask(fourth, fourth);
+            return offset + 192 + (size_t)__builtin_ctzll(zero_mask);
+        }
+    }
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl"), always_inline))
@@ -1201,186 +1179,213 @@ static inline int compare_block_avx512(const unsigned char *left,
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl"), always_inline))
-static inline int compare_block_avx512_128(const unsigned char *left,
-    const unsigned char *right, size_t *stop_index)
+static inline uint64_t string_stop_mask_at_avx512(const unsigned char *left,
+    const unsigned char *right)
 {
-    __m512i left0 = _mm512_loadu_si512((const void *)left);
-    __m512i left1 = _mm512_loadu_si512((const void *)(left + 64));
-    __m512i right0 = _mm512_loadu_si512((const void *)right);
-    __m512i right1 = _mm512_loadu_si512((const void *)(right + 64));
-    __m512i minimum = _mm512_min_epu8(left0, left1);
-    __m512i difference0 = _mm512_xor_si512(left0, right0);
-    __m512i difference1 = _mm512_xor_si512(left1, right1);
-    __m512i difference = _mm512_ternarylogic_epi32(difference0, difference1,
-        difference1, 0xfe);
-    __mmask64 no_zero = _mm512_test_epi8_mask(minimum, minimum);
-    __mmask64 equal = _mm512_mask_testn_epi8_mask(no_zero, difference, difference);
+    return string_chunk_stop_mask_avx512_64(_mm512_loadu_si512((const void *)left),
+        _mm512_loadu_si512((const void *)right));
+}
 
-    if ((uint64_t)(equal + 1U) == 0) {
+static inline uint64_t low_bits_mask(size_t count)
+{
+    return count >= 64 ? UINT64_MAX : ((uint64_t)1 << count) - 1U;
+}
+
+/*
+ * Main strcmp/strncmp loop, entered with at least 64 matching bytes before
+ * `left + step` already checked; strcmp passes SIZE_MAX as the count.
+ *
+ * Only plain unaligned loads are used: near a page end the 64-byte window
+ * ending exactly at the boundary is compared instead, whose leading bytes were
+ * already checked. `left` is kept 64-byte aligned so its loads never split a
+ * cache line.
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl"), always_inline))
+static inline int compare_strings_loop_avx512(const unsigned char *left,
+    const unsigned char *right, size_t count, size_t step)
+{
+    uint64_t stop_mask;
+
+    for (;;) {
+        left += step;
+        right += step;
+        count -= step;
+
+        size_t left_room = 4096U - ((uintptr_t)left & 4095U);
+        size_t right_room = 4096U - ((uintptr_t)right & 4095U);
+        size_t room = left_room < right_room ? left_room : right_room;
+
+        if (room > count) {
+            room = count;
+        }
+        if (room >= 64) {
+            /* Every chunk below lies inside both pages and inside `count`. */
+            if (((uintptr_t)left & 63U) != 0) {
+                stop_mask = string_stop_mask_at_avx512(left, right);
+                if (stop_mask != 0) {
+                    size_t index = (size_t)__builtin_ctzll(stop_mask);
+                    return (int)left[index] - (int)right[index];
+                }
+                step = 64U - ((uintptr_t)left & 63U);
+                left += step;
+                right += step;
+                count -= step;
+                room -= step;
+            }
+            for (; room >= 256; room -= 256) {
+                size_t stop_index;
+
+                if (compare_block_avx512(left, right, &stop_index)) {
+                    return (int)left[stop_index] - (int)right[stop_index];
+                }
+                left += 256;
+                right += 256;
+                count -= 256;
+            }
+            for (; room >= 64; room -= 64) {
+                stop_mask = string_stop_mask_at_avx512(left, right);
+                if (stop_mask != 0) {
+                    size_t index = (size_t)__builtin_ctzll(stop_mask);
+                    return (int)left[index] - (int)right[index];
+                }
+                left += 64;
+                right += 64;
+                count -= 64;
+            }
+        }
+        if (room == 0) {
+            if (count == 0) {
+                return 0;
+            }
+            step = 0;
+            continue;
+        }
+
+        size_t back = 64U - room;
+
+        stop_mask = string_stop_mask_at_avx512(left - back, right - back);
+        if (stop_mask != 0) {
+            size_t index = (size_t)__builtin_ctzll(stop_mask);
+            return (int)left[index - back] - (int)right[index - back];
+        }
+        if (count <= room) {
+            return 0;
+        }
+        step = room;
+    }
+}
+
+/*
+ * A string starts within 352 bytes of a page end: compare with masked loads
+ * (which never fault on masked-off bytes) until 64 bytes are readable in
+ * both, then check one plain chunk and continue in the main loop.
+ */
+__attribute__((target("avx512f,avx512bw,avx512vl"), noinline))
+static int compare_strings_page_start_avx512(const unsigned char *left,
+    const unsigned char *right, size_t count)
+{
+    uint64_t stop_mask;
+
+    for (;;) {
+        size_t left_room = 4096U - ((uintptr_t)left & 4095U);
+        size_t right_room = 4096U - ((uintptr_t)right & 4095U);
+        size_t room = left_room < right_room ? left_room : right_room;
+
+        if (count == 0) {
+            return 0;
+        }
+        if (room >= 64) {
+            break;
+        }
+
+        size_t limit = count < room ? count : room;
+        __mmask64 valid = (__mmask64)low_bits_mask(limit);
+
+        stop_mask = string_chunk_stop_mask_avx512_64(_mm512_maskz_loadu_epi8(valid, left),
+            _mm512_maskz_loadu_epi8(valid, right)) & (uint64_t)valid;
+        if (stop_mask != 0) {
+            size_t index = (size_t)__builtin_ctzll(stop_mask);
+            return (int)left[index] - (int)right[index];
+        }
+        left += limit;
+        right += limit;
+        count -= limit;
+    }
+    stop_mask = string_stop_mask_at_avx512(left, right) & low_bits_mask(count);
+    if (stop_mask != 0) {
+        size_t index = (size_t)__builtin_ctzll(stop_mask);
+        return (int)left[index] - (int)right[index];
+    }
+    if (count <= 64) {
         return 0;
     }
-    uint64_t stop_mask = string_chunk_stop_mask_avx512_64(left0, right0);
-    if (stop_mask != 0) {
-        *stop_index = (size_t)__builtin_ctzll(stop_mask);
-        return 1;
+    return compare_strings_loop_avx512(left, right, count, 64U - ((uintptr_t)left & 63U));
+}
+
+#define STRING_HEAD_BYTES 352U
+
+__attribute__((target("avx512f,avx512bw,avx512vl"), always_inline))
+static inline int compare_strings_avx512_core(const unsigned char *left,
+    const unsigned char *right, size_t count)
+{
+    size_t left_off = (uintptr_t)left & 4095U;
+    size_t right_off = (uintptr_t)right & 4095U;
+
+    if (__builtin_expect((left_off > right_off ? left_off : right_off) >
+            4096U - STRING_HEAD_BYTES, 0)) {
+        return compare_strings_page_start_avx512(left, right, count);
     }
-    stop_mask = string_chunk_stop_mask_avx512_64(left1, right1);
-    *stop_index = 64 + (size_t)__builtin_ctzll(stop_mask);
-    return 1;
+    /*
+     * Both strings have STRING_HEAD_BYTES readable bytes: check them in
+     * straight-line code, which is all that short strings need.
+     */
+    {
+        __m256i left_head = _mm256_loadu_si256((const __m256i *)left);
+        uint32_t head_stop = ~(uint32_t)_mm256_mask_cmpeq_epi8_mask(
+            _mm256_test_epi8_mask(left_head, left_head), left_head,
+            _mm256_loadu_si256((const __m256i *)right));
+
+        if (count < 32) {
+            head_stop &= (uint32_t)low_bits_mask(count);
+        }
+        if (head_stop != 0) {
+            size_t index = (size_t)__builtin_ctz(head_stop);
+            return (int)left[index] - (int)right[index];
+        }
+        if (count <= 32) {
+            return 0;
+        }
+    }
+    for (size_t offset = 32; offset < STRING_HEAD_BYTES; offset += 64) {
+        uint64_t stop_mask = string_stop_mask_at_avx512(left + offset, right + offset);
+
+        if (count < offset + 64) {
+            stop_mask &= low_bits_mask(count - offset);
+        }
+        if (stop_mask != 0) {
+            size_t index = offset + (size_t)__builtin_ctzll(stop_mask);
+            return (int)left[index] - (int)right[index];
+        }
+        if (count <= offset + 64) {
+            return 0;
+        }
+    }
+    /* Advance at most the checked bytes, leaving `left` 64-byte aligned. */
+    return compare_strings_loop_avx512(left, right, count,
+        STRING_HEAD_BYTES - ((uintptr_t)(left + STRING_HEAD_BYTES) & 63U));
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static int compare_strings_avx512(const unsigned char *left, const unsigned char *right)
 {
-    for (;;) {
-        size_t left_room = 4096U - ((uintptr_t)left & 4095U);
-        size_t right_room = 4096U - ((uintptr_t)right & 4095U);
-        size_t safe_room = left_room < right_room ? left_room : right_room;
-
-        while (safe_room >= 256) {
-            size_t stop_index;
-
-            if (compare_block_avx512(left, right, &stop_index)) {
-                return (int)left[stop_index] - (int)right[stop_index];
-            }
-            left += 256;
-            right += 256;
-            safe_room -= 256;
-        }
-        if (safe_room >= 128) {
-            size_t stop_index;
-
-            if (compare_block_avx512_128(left, right, &stop_index)) {
-                return (int)left[stop_index] - (int)right[stop_index];
-            }
-            left += 128;
-            right += 128;
-            safe_room -= 128;
-        }
-        if (safe_room >= 64) {
-            __m512i left_chunk = _mm512_loadu_si512((const void *)left);
-            __m512i right_chunk = _mm512_loadu_si512((const void *)right);
-            uint64_t stop_mask = string_chunk_stop_mask_avx512_64(left_chunk, right_chunk);
-
-            if (stop_mask != 0) {
-                size_t index = (size_t)__builtin_ctzll(stop_mask);
-                return (int)left[index] - (int)right[index];
-            }
-            left += 64;
-            right += 64;
-            safe_room -= 64;
-        }
-        while (safe_room >= 32) {
-            __m256i left_chunk = _mm256_loadu_si256((const __m256i *)left);
-            __m256i right_chunk = _mm256_loadu_si256((const __m256i *)right);
-            unsigned int stop_mask = string_chunk_stop_mask_avx512(left_chunk, right_chunk);
-
-            if (stop_mask != 0) {
-                size_t index = (size_t)__builtin_ctz(stop_mask);
-                return (int)left[index] - (int)right[index];
-            }
-            left += 32;
-            right += 32;
-            safe_room -= 32;
-        }
-        while (safe_room > 0) {
-            if (*left != *right) {
-                return (int)*left - (int)*right;
-            }
-            if (*left == '\0') {
-                return 0;
-            }
-            left++;
-            right++;
-            safe_room--;
-        }
-    }
+    return compare_strings_avx512_core(left, right, SIZE_MAX);
 }
 
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static int compare_n_strings_avx512(const unsigned char *left, const unsigned char *right,
     size_t count)
 {
-    for (;;) {
-        if (count == 0) {
-            return 0;
-        }
-        size_t left_room = 4096U - ((uintptr_t)left & 4095U);
-        size_t right_room = 4096U - ((uintptr_t)right & 4095U);
-        size_t safe_room = left_room < right_room ? left_room : right_room;
-
-        while (count >= 256 && safe_room >= 256) {
-            size_t stop_index;
-
-            if (compare_block_avx512(left, right, &stop_index)) {
-                return (int)left[stop_index] - (int)right[stop_index];
-            }
-            left += 256;
-            right += 256;
-            count -= 256;
-            safe_room -= 256;
-        }
-        if (count == 0) {
-            return 0;
-        }
-        if (count >= 128 && safe_room >= 128) {
-            size_t stop_index;
-
-            if (compare_block_avx512_128(left, right, &stop_index)) {
-                return (int)left[stop_index] - (int)right[stop_index];
-            }
-            left += 128;
-            right += 128;
-            count -= 128;
-            safe_room -= 128;
-        }
-        if (count >= 64 && safe_room >= 64) {
-            __m512i left_chunk = _mm512_loadu_si512((const void *)left);
-            __m512i right_chunk = _mm512_loadu_si512((const void *)right);
-            uint64_t stop_mask = string_chunk_stop_mask_avx512_64(left_chunk, right_chunk);
-
-            if (stop_mask != 0) {
-                size_t index = (size_t)__builtin_ctzll(stop_mask);
-                return (int)left[index] - (int)right[index];
-            }
-            left += 64;
-            right += 64;
-            count -= 64;
-            safe_room -= 64;
-        }
-        while (count >= 32 && safe_room >= 32) {
-            __m256i left_chunk = _mm256_loadu_si256((const __m256i *)left);
-            __m256i right_chunk = _mm256_loadu_si256((const __m256i *)right);
-            unsigned int stop_mask = string_chunk_stop_mask_avx512(left_chunk, right_chunk);
-
-            if (stop_mask != 0) {
-                size_t index = (size_t)__builtin_ctz(stop_mask);
-                return (int)left[index] - (int)right[index];
-            }
-            left += 32;
-            right += 32;
-            count -= 32;
-            safe_room -= 32;
-        }
-        if (count == 0) {
-            return 0;
-        }
-        if (safe_room == 0) {
-            continue;
-        }
-        size_t chunk = count < safe_room ? count : safe_room;
-        for (size_t index = 0; index < chunk; index++) {
-            if (left[index] != right[index]) {
-                return (int)left[index] - (int)right[index];
-            }
-            if (left[index] == '\0') {
-                return 0;
-            }
-        }
-        left += chunk;
-        right += chunk;
-        count -= chunk;
-    }
+    return compare_strings_avx512_core(left, right, count);
 }
 
 #endif
@@ -1487,6 +1492,11 @@ void *memset(void *destination, int value, size_t count)
         return destination;
     }
 #if defined(IRIS_HAVE_AVX2)
+    if (__builtin_expect(count <= 256, 1) && __builtin_expect(cpu_avx512_known(), 1)) {
+        return set_medium_avx512(destination, value, count);
+    }
+#endif
+#if defined(IRIS_HAVE_AVX2)
     if (cpu_has_avx512()) {
         return set_avx512(destination, value, count);
     }
@@ -1501,7 +1511,7 @@ int memcmp(const void *left, const void *right, size_t count)
 {
 #if defined(IRIS_HAVE_AVX2)
     if (count >= 64) {
-        if (cpu_has_avx512()) {
+        if (__builtin_expect(cpu_avx512_known(), 1) || cpu_has_avx512()) {
             if (count <= 256) {
                 return memcmp_short_avx512((const unsigned char *)left,
                     (const unsigned char *)right, count);
@@ -1534,10 +1544,14 @@ int memcmp(const void *left, const void *right, size_t count)
     return compare_bytes(left, right, count);
 }
 
-size_t strlen(const char *string)
+__attribute__((noinline))
+static size_t strlen_generic(const unsigned char *bytes)
 {
-    const unsigned char *bytes = (const unsigned char *)string;
-
+#if defined(IRIS_HAVE_AVX2)
+    if (cpu_has_avx512()) {
+        return strlen_avx512(bytes);
+    }
+#endif
     if (__builtin_expect(((uintptr_t)bytes & 4095U) <= 4096U - 32U, 1)) {
         const __m128i zero = _mm_setzero_si128();
         __m128i first = _mm_loadu_si128((const __m128i *)bytes);
@@ -1554,23 +1568,48 @@ size_t strlen(const char *string)
         }
     }
 #if defined(IRIS_HAVE_AVX2)
-    if (cpu_has_avx512()) {
-        return strlen_avx512((const unsigned char *)string);
-    }
     if (cpu_has_avx2()) {
-        return strlen_avx2((const unsigned char *)string);
+        return strlen_avx2(bytes);
     }
 #endif
-    return strlen_sse2((const unsigned char *)string);
+    return strlen_sse2(bytes);
 }
 
-int strcmp(const char *left, const char *right)
+size_t strlen(const char *string)
 {
-    const unsigned char *left_bytes = (const unsigned char *)left;
-    const unsigned char *right_bytes = (const unsigned char *)right;
+    const unsigned char *bytes = (const unsigned char *)string;
+
+    /* Short strings: two SSE2 compares beat entering the wider vector path. */
+    if (__builtin_expect(((uintptr_t)bytes & 4095U) <= 4096U - 32U, 1)) {
+        const __m128i zero = _mm_setzero_si128();
+        unsigned int zero_mask = (unsigned int)_mm_movemask_epi8(
+            _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)bytes), zero)) |
+            ((unsigned int)_mm_movemask_epi8(
+            _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(bytes + 16)), zero)) << 16);
+
+        if (zero_mask != 0) {
+            return (size_t)__builtin_ctz(zero_mask);
+        }
+    }
+#if defined(IRIS_HAVE_AVX2)
+    if (__builtin_expect(cpu_avx512_known(), 1)) {
+        return strlen_avx512(bytes);
+    }
+#endif
+    return strlen_generic(bytes);
+}
+
+__attribute__((noinline))
+static int strcmp_generic(const unsigned char *left_bytes, const unsigned char *right_bytes)
+{
     size_t left_off = (uintptr_t)left_bytes & 4095U;
     size_t right_off = (uintptr_t)right_bytes & 4095U;
 
+#if defined(IRIS_HAVE_AVX2)
+    if (cpu_has_avx512()) {
+        return compare_strings_avx512(left_bytes, right_bytes);
+    }
+#endif
     if (__builtin_expect((left_off <= 4096U - 32U) & (right_off <= 4096U - 32U), 1)) {
         __m128i left0 = _mm_loadu_si128((const __m128i *)left_bytes);
         __m128i right0 = _mm_loadu_si128((const __m128i *)right_bytes);
@@ -1590,9 +1629,6 @@ int strcmp(const char *left, const char *right)
         right_bytes += 32;
     }
 #if defined(IRIS_HAVE_AVX2)
-    if (cpu_has_avx512()) {
-        return compare_strings_avx512(left_bytes, right_bytes);
-    }
     if (cpu_has_avx2()) {
         return compare_strings_avx2(left_bytes, right_bytes, SIZE_MAX, 0);
     }
@@ -1600,9 +1636,28 @@ int strcmp(const char *left, const char *right)
     return compare_strings_sse2(left_bytes, right_bytes, SIZE_MAX, 0);
 }
 
-int strncmp(const char *left, const char *right, size_t count)
+int strcmp(const char *left, const char *right)
 {
-    if (count == 16) {
+#if defined(IRIS_HAVE_AVX2)
+    if (__builtin_expect(cpu_avx512_known(), 1)) {
+        return compare_strings_avx512((const unsigned char *)left,
+            (const unsigned char *)right);
+    }
+#endif
+    return strcmp_generic((const unsigned char *)left, (const unsigned char *)right);
+}
+
+__attribute__((noinline))
+static int strncmp_generic(const char *left, const char *right, size_t count)
+{
+#if defined(IRIS_HAVE_AVX2)
+    if (cpu_has_avx512()) {
+        return compare_n_strings_avx512((const unsigned char *)left,
+            (const unsigned char *)right, count);
+    }
+#endif
+    if (count == 16 && (((uintptr_t)left & 4095U) <= 4096U - 16U) &
+            (((uintptr_t)right & 4095U) <= 4096U - 16U)) {
         __m128i left_chunk = _mm_loadu_si128((const __m128i *)left);
         __m128i right_chunk = _mm_loadu_si128((const __m128i *)right);
         unsigned int stop_mask = string_chunk_stop_mask(left_chunk, right_chunk);
@@ -1612,7 +1667,7 @@ int strncmp(const char *left, const char *right, size_t count)
         }
         return 0;
     }
-    if (count < 16) {
+    if (count <= 16) {
         for (size_t index = 0; index < count; index++) {
             unsigned char left_char = (unsigned char)left[index];
             unsigned char right_char = (unsigned char)right[index];
@@ -1626,21 +1681,44 @@ int strncmp(const char *left, const char *right, size_t count)
         return 0;
     }
 #if defined(IRIS_HAVE_AVX2)
-    if (count >= 64) {
-        if (cpu_has_avx512()) {
-            return compare_n_strings_avx512((const unsigned char *)left,
-                (const unsigned char *)right, count);
-        }
-        if (cpu_has_avx2()) {
-            return compare_strings_avx2((const unsigned char *)left,
-                (const unsigned char *)right, count, 1);
-        }
-    } else if (count >= 32 && cpu_has_avx2()) {
+    if (count >= 32 && cpu_has_avx2()) {
         return compare_strings_avx2((const unsigned char *)left, (const unsigned char *)right,
             count, 1);
     }
 #endif
     return compare_strings_sse2((const unsigned char *)left, (const unsigned char *)right,
         count, 1);
+}
+
+int strncmp(const char *left, const char *right, size_t count)
+{
+    const unsigned char *left_bytes = (const unsigned char *)left;
+    const unsigned char *right_bytes = (const unsigned char *)right;
+
+    /* Small bounds: two SSE2 compares beat entering the wider vector path. */
+    if (count <= 32 && (((uintptr_t)left_bytes & 4095U) <= 4096U - 32U) &
+            (((uintptr_t)right_bytes & 4095U) <= 4096U - 32U)) {
+        unsigned int stop_mask = string_chunk_stop_mask(
+            _mm_loadu_si128((const __m128i *)left_bytes),
+            _mm_loadu_si128((const __m128i *)right_bytes)) |
+            (string_chunk_stop_mask(_mm_loadu_si128((const __m128i *)(left_bytes + 16)),
+            _mm_loadu_si128((const __m128i *)(right_bytes + 16))) << 16);
+
+        if (count < 32) {
+            stop_mask &= (1U << count) - 1U;
+        }
+        if (stop_mask != 0) {
+            size_t index = (size_t)__builtin_ctz(stop_mask);
+            return (int)left_bytes[index] - (int)right_bytes[index];
+        }
+        return 0;
+    }
+#if defined(IRIS_HAVE_AVX2)
+    if (__builtin_expect(cpu_avx512_known(), 1)) {
+        return compare_n_strings_avx512((const unsigned char *)left,
+            (const unsigned char *)right, count);
+    }
+#endif
+    return strncmp_generic(left, right, count);
 }
 #endif

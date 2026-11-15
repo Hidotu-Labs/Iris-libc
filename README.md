@@ -11,6 +11,10 @@ APIs are not implemented yet.
 
 The source is split between portable implementations in `src/memory.c` and
 `src/string.c`, and x86-64 SIMD implementations in `src/string_x86_64.c`.
+`ctype.h` supports the `C`/`POSIX` locales and the built-in
+`en_US.ISO-8859-1` locale for byte classification and case conversion. The
+locale API currently supports `LC_CTYPE` and `LC_ALL`; UTF-8 decoding and
+wide-character functions are not implemented.
 
 ## Build, test, and benchmark
 
@@ -21,6 +25,7 @@ make benchmark
 make hello
 make examples
 make file-copy SOURCE=input.bin DESTINATION=output.bin
+make kilo KILO_SOURCE=/path/to/kilo.c
 ```
 
 The build produces `libc.a`. Stdio includes `printf`, `vprintf`, `fprintf`,
@@ -38,6 +43,8 @@ compares the implemented memory, string, unistd, `snprintf`, `fprintf`, and
 `fputc` against one-byte writes. A separate stdio benchmark compares every
 function currently declared in `stdio.h`; `fopen` timing includes the paired
 `fclose` needed to release each stream.
+`make kilo KILO_SOURCE=...` builds a freestanding Kilo editor binary using
+Iris's startup code and library archive.
 `make benchmark-musl` runs the same
 benchmark against musl, using `musl-gcc` by default; set `MUSL_CC` to use a
 different musl compiler wrapper. An Iris speedup above `1.00x` means Iris was

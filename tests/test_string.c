@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -211,6 +212,9 @@ static int check_page_edge_strings(void)
     *last_byte = '\0';
     int failed = strlen(last_byte) != 0 || strcmp(last_byte, "") != 0 ||
         strncmp(last_byte, "", 1) != 0;
+    if (strchr(last_byte, '\0') != last_byte || strchr(last_byte, 'q') != NULL) {
+        failed = 1;
+    }
 
     /* After strcmp's 32-byte prefix, its AVX-512 path compares this exact
      * 256-byte range, ending at the readable page boundary. */
@@ -247,6 +251,26 @@ static int check_page_edge_strings(void)
     }
     munmap(mapping, mapping_size);
     return failed ? 4 : 0;
+}
+
+static int check_extended_strings(void)
+{
+    const char text[] = "abcabc";
+
+    if (strchr(text, 'b') != text + 1 || strchr(text, '\0') != text + 6 ||
+        strchr(text, 'z') != NULL || strchr(text, 0x161) != text) {
+        return 1;
+    }
+    if (strstr(text, "cab") != text + 2 || strstr(text, "") != text ||
+        strstr(text, "abcd") != NULL || strstr("aaaaab", "aaab") != "aaaaab" + 2 ||
+        strstr("abc", "bc") != "abc" + 1) {
+        return 2;
+    }
+    if (strcmp(strerror(ENOENT), "No such file or directory") != 0 ||
+        strcmp(strerror(-1), "Unknown error") != 0) {
+        return 3;
+    }
+    return 0;
 }
 
 static int check_unistd(void)
@@ -660,6 +684,84 @@ static int check_line_streams(void)
     return 0;
 }
 
+static int check_stdio_extensions(void)
+{
+    const char *path = "/tmp/iris-libc-stdio-extensions-test";
+    char source[BUFSIZ + 300];
+    for (size_t index = 0; index < sizeof(source); index++) {
+        source[index] = 'x';
+    }
+
+    FILE *stream = fopen(path, "w");
+    if (stream == NULL || fwrite(source, 1, sizeof(source), stream) != sizeof(source) ||
+        fputs("\nlast", stream) == EOF || fclose(stream) != 0) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 1;
+    }
+
+    stream = fopen(path, "r");
+    if (stream == NULL) {
+        unlink(path);
+        return 2;
+    }
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length = getline(&line, &capacity, stream);
+    if (length != (ssize_t)sizeof(source) + 1 || capacity <= sizeof(source) ||
+        line[length - 1] != '\n' || line[length] != '\0') {
+        free(line);
+        fclose(stream);
+        unlink(path);
+        return 3;
+    }
+    length = getline(&line, &capacity, stream);
+    if (length != 4 || strcmp(line, "last") != 0 ||
+        getline(&line, &capacity, stream) != -1 || !feof(stream)) {
+        free(line);
+        fclose(stream);
+        unlink(path);
+        return 4;
+    }
+    free(line);
+    if (fclose(stream) != 0 || unlink(path) != 0) {
+        return 5;
+    }
+
+    int rows = 0;
+    int columns = 0;
+    if (sscanf(" 24; 80", "%d;%d", &rows, &columns) != 2 ||
+        rows != 24 || columns != 80 || sscanf("24,x", "%d;%d", &rows, &columns) != 1 ||
+        sscanf("100%", "%d%%", &rows) != 1 || rows != 100) {
+        return 6;
+    }
+
+    stream = fopen(path, "w");
+    if (stream == NULL) {
+        unlink(path);
+        return 7;
+    }
+    FILE *saved_stderr = stderr;
+    stderr = stream;
+    errno = ENOENT;
+    perror("opening");
+    stderr = saved_stderr;
+    if (fflush(stream) != 0 || fclose(stream) != 0) {
+        unlink(path);
+        return 8;
+    }
+    stream = fopen(path, "r");
+    char message[128];
+    if (stream == NULL || fgets(message, sizeof(message), stream) == NULL ||
+        strcmp(message, "opening: No such file or directory\n") != 0 ||
+        fclose(stream) != 0 || unlink(path) != 0) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 9;
+    }
+    return 0;
+}
+
 int main(void)
 {
     char buffer[8] = "iris";
@@ -705,6 +807,10 @@ int main(void)
     if (page_result != 0) {
         return 30 + page_result;
     }
+    int extended_string_result = check_extended_strings();
+    if (extended_string_result != 0) {
+        return 35 + extended_string_result;
+    }
     int unistd_result = check_unistd();
     if (unistd_result != 0) {
         return 40 + unistd_result;
@@ -724,6 +830,10 @@ int main(void)
     int line_stream_result = check_line_streams();
     if (line_stream_result != 0) {
         return 100 + line_stream_result;
+    }
+    int stdio_extension_result = check_stdio_extensions();
+    if (stdio_extension_result != 0) {
+        return 120 + stdio_extension_result;
     }
 
     return 0;

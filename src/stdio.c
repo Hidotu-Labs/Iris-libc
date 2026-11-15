@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -466,6 +467,88 @@ int fgetc(FILE *stream)
         stream->buffer_position = 0;
     }
     return stream->buffer[stream->buffer_position++];
+}
+
+static inline size_t newline_offset(const unsigned char *buffer, size_t length);
+
+ssize_t __iris_getline_impl(char **restrict line, size_t *restrict capacity,
+    FILE *restrict stream, void *(*allocate)(size_t),
+    void *(*resize)(void *, size_t))
+{
+    if (line == NULL || capacity == NULL || !stream_active(stream) ||
+        (stream->flags & STREAM_READ) == 0) {
+        errno = EINVAL;
+        if (stream_active(stream)) stream->flags |= STREAM_ERROR;
+        return -1;
+    }
+
+    if (*line == NULL || *capacity == 0) {
+        *capacity = 128;
+        *line = allocate(*capacity);
+        if (*line == NULL) {
+            errno = ENOMEM;
+            *capacity = 0;
+            return -1;
+        }
+    }
+
+    if ((stream->flags & STREAM_LAST_WRITE) != 0 && fflush(stream) == EOF) {
+        return -1;
+    }
+    if ((stream->flags & STREAM_LAST_READ) == 0) {
+        stream->flags = (stream->flags & ~STREAM_LAST_WRITE) | STREAM_LAST_READ;
+    }
+
+    size_t length = 0;
+    for (;;) {
+        if (stream->buffer_position == stream->buffer_length) {
+            ssize_t result;
+            do {
+                result = read(stream->file_descriptor, stream->buffer, BUFSIZ);
+            } while (result < 0 && errno == EINTR);
+            if (result < 0) {
+                stream->flags |= STREAM_ERROR;
+                return -1;
+            }
+            if (result == 0) {
+                stream->flags |= STREAM_EOF;
+                if (length == 0) return -1;
+                break;
+            }
+            stream->buffer_length = (size_t)result;
+            stream->buffer_position = 0;
+        }
+
+        unsigned char *source = stream->buffer + stream->buffer_position;
+        size_t available = stream->buffer_length - stream->buffer_position;
+        size_t chunk = newline_offset(source, available);
+        int found_newline = chunk < available;
+        if (found_newline) chunk++;
+        if (chunk > SIZE_MAX - length - 1) {
+            errno = ENOMEM;
+            return -1;
+        }
+        size_t required = length + chunk + 1;
+        while (*capacity < required) {
+            size_t new_capacity = *capacity > SIZE_MAX / 2
+                ? required : *capacity * 2;
+            char *new_line = resize(*line, new_capacity);
+            if (new_line == NULL) {
+                errno = ENOMEM;
+                return -1;
+            }
+            *line = new_line;
+            *capacity = new_capacity;
+        }
+
+        memcpy(*line + length, source, chunk);
+        length += chunk;
+        stream->buffer_position += chunk;
+        if (found_newline) break;
+    }
+
+    (*line)[length] = '\0';
+    return (ssize_t)length;
 }
 
 int fputc(int character, FILE *stream)

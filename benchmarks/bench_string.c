@@ -2,6 +2,7 @@
 
 #include "bench_common.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -20,6 +21,9 @@ extern int iris_memcmp(const void *left, const void *right, size_t count);
 extern size_t iris_strlen(const char *string);
 extern int iris_strcmp(const char *left, const char *right);
 extern int iris_strncmp(const char *left, const char *right, size_t count);
+extern char *iris_strchr(const char *string, int character);
+extern char *iris_strstr(const char *string, const char *substring);
+extern char *iris_strerror(int error_number);
 extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
 extern int iris_snprintf(char *buffer, size_t size, const char *format, ...);
 typedef struct iris_FILE iris_FILE;
@@ -37,6 +41,9 @@ typedef int (*memory_compare_function)(const void *, const void *, size_t);
 typedef size_t (*length_function)(const char *);
 typedef int (*string_compare_function)(const char *, const char *);
 typedef int (*string_ncompare_function)(const char *, const char *, size_t);
+typedef char *(*character_search_function)(const char *, int);
+typedef char *(*substring_search_function)(const char *, const char *);
+typedef char *(*error_text_function)(int);
 typedef ssize_t (*write_function)(int, const void *, size_t);
 typedef int (*snprintf_function)(char *, size_t, const char *, ...);
 typedef union {
@@ -47,6 +54,9 @@ typedef union {
     length_function length;
     string_compare_function string_compare;
     string_ncompare_function string_ncompare;
+    character_search_function character_search;
+    substring_search_function substring_search;
+    error_text_function error_text;
     snprintf_function format;
 } benchmark_function;
 
@@ -202,6 +212,63 @@ static double time_string_ncompare(size_t size, size_t iterations, benchmark_fun
     clock_gettime(CLOCK_MONOTONIC, &end);
     benchmark_sink += (size_t)(result + 1);
 
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_character_search(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    character_search_function function = opaque_function.character_search;
+    static const char text[] = "Iris libc Kilo compatibility benchmark";
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+
+    (void)size;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(text, 'b');
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (size_t)(result - text) : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_substring_search(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    substring_search_function function = opaque_function.substring_search;
+    static const char text[] = "Iris libc Kilo compatibility benchmark";
+    static const char substring[] = "benchmark";
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+
+    (void)size;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(text, substring);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (size_t)(result - text) : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_error_text(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    error_text_function function = opaque_function.error_text;
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+
+    (void)size;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(ENOENT);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (unsigned char)result[0] : 0;
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
@@ -410,6 +477,13 @@ int main(void)
         REPORT(strcmp, size, iterations, time_string_compare, string_compare, strcmp, iris_strcmp);
         REPORT(strncmp, size, iterations, time_string_ncompare, string_ncompare, strncmp, iris_strncmp);
     }
+
+    REPORT(strchr, 0, FORMATTED_IO_ITERATIONS, time_character_search,
+        character_search, strchr, iris_strchr);
+    REPORT(strstr, 0, FORMATTED_IO_ITERATIONS, time_substring_search,
+        substring_search, strstr, iris_strstr);
+    REPORT(strerror, 0, FORMATTED_IO_ITERATIONS, time_error_text,
+        error_text, strerror, iris_strerror);
 
     puts("snprintf formatting vs libc; median of 6 trials");
     puts("+----------+----------+------------------+------------------+------------------+");

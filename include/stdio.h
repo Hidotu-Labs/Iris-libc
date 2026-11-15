@@ -3,6 +3,7 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <sys/types.h>
 
 typedef struct iris_FILE FILE;
 
@@ -38,5 +39,11 @@ int puts(const char *string);
 int feof(FILE *stream);
 int ferror(FILE *stream);
 void clearerr(FILE *stream);
+ssize_t getline(char **restrict line, size_t *restrict capacity,
+	FILE *restrict stream);
+int vsscanf(const char *restrict input, const char *restrict format,
+	va_list arguments);
+int sscanf(const char *restrict input, const char *restrict format, ...);
+void perror(const char *message);
 
 #endif

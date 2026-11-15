@@ -26,6 +26,9 @@ struct free_node {
 static struct free_node *free_lists[IRIS_CLASS_COUNT];
 static unsigned char *slab_cursor = NULL;
 static size_t slab_remaining = 0;
+static void (*exit_handlers[32])(void);
+static size_t exit_handler_count;
+static int exit_handlers_running;
 
 static inline size_t size_to_class(size_t size)
 {
@@ -194,8 +197,26 @@ void *realloc(void *pointer, size_t size)
     return updated;
 }
 
+int atexit(void (*function)(void))
+{
+    if (function == NULL || exit_handler_count ==
+        sizeof(exit_handlers) / sizeof(exit_handlers[0])) {
+        errno = ENOMEM;
+        return -1;
+    }
+    exit_handlers[exit_handler_count++] = function;
+    return 0;
+}
+
 _Noreturn void exit(int status)
 {
+    if (!exit_handlers_running) {
+        exit_handlers_running = 1;
+        while (exit_handler_count != 0) {
+            void (*function)(void) = exit_handlers[--exit_handler_count];
+            function();
+        }
+    }
     fflush(NULL);
     _exit(status);
 }
