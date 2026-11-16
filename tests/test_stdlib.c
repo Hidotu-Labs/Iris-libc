@@ -36,8 +36,31 @@ static int compare_ints(const void *left, const void *right)
     return (a > b) - (a < b);
 }
 
-int main(void)
+int main(int argc, char **argv, char **envp)
 {
+    (void)argc;
+    (void)argv;
+
+    if (envp != NULL && envp[0] != NULL) {
+        char *separator = strchr(envp[0], '=');
+        if (separator != NULL) {
+            size_t name_length = (size_t)(separator - envp[0]);
+            char name[128];
+            if (name_length >= sizeof(name)) {
+                return 39;
+            }
+            memcpy(name, envp[0], name_length);
+            name[name_length] = '\0';
+            if (getenv(name) == NULL || strcmp(getenv(name), separator + 1) != 0) {
+                return 39;
+            }
+        }
+    }
+    errno = 0;
+    if (system(NULL) != 0 || system("command") != -1 || errno != ENOSYS) {
+        return 41;
+    }
+
     char *small = malloc(24);
     if (small == NULL) {
         return 1;
@@ -105,6 +128,63 @@ int main(void)
     errno = 0;
     if (strtol("1", &end, 1) != 0 || errno != EINVAL) {
         return 14;
+    }
+
+    errno = 0;
+    double parsed = strtod(" -12.375e2tail", &end);
+    if (parsed != -1237.5 || strcmp(end, "tail") != 0 || errno != 0) {
+        return 30;
+    }
+    parsed = strtod("0x1.8p+2", &end);
+    if (parsed != 6.0 || *end != '\0') {
+        return 31;
+    }
+    parsed = strtod(" +.5e-1!", &end);
+    if (parsed != 0.05 || strcmp(end, "!") != 0) {
+        return 42;
+    }
+    const char incomplete_exponent[] = "1e+tail";
+    if (strtod(incomplete_exponent, &end) != 1.0 ||
+        end != incomplete_exponent + 1) {
+        return 43;
+    }
+    const char incomplete_hex[] = "0x";
+    if (strtod(incomplete_hex, &end) != 0.0 || end != incomplete_hex + 1) {
+        return 44;
+    }
+    errno = 0;
+    parsed = strtod("1e-323", &end);
+    if (parsed <= 0.0 || errno != ERANGE || *end != '\0') {
+        return 45;
+    }
+    parsed = strtod("-INFINITY!", &end);
+    if (!(parsed < -1e300) || strcmp(end, "!") != 0) {
+        return 32;
+    }
+    parsed = strtod("nan(payload)", &end);
+    if (parsed == parsed || *end != '\0') {
+        return 33;
+    }
+    errno = 0;
+    parsed = strtod("1e9999", &end);
+    if (!(parsed > 1e300) || errno != ERANGE || *end != '\0') {
+        return 34;
+    }
+    errno = 0;
+    if (strtod("1e-9999", &end) != 0.0 || errno != ERANGE || *end != '\0') {
+        return 35;
+    }
+    const char invalid_number[] = "not-a-number";
+    if (strtod(invalid_number, &end) != 0.0 || end != invalid_number) {
+        return 36;
+    }
+    if (localeconv() == NULL || strcmp(localeconv()->decimal_point, ".") != 0) {
+        return 37;
+    }
+    sig_atomic_t signal_safe_value = 0;
+    signal_safe_value++;
+    if (signal_safe_value != 1) {
+        return 38;
     }
 
     if (!isalnum('7') || !isalnum('z') || isalnum('_') ||
@@ -183,6 +263,35 @@ int main(void)
     }
     if (time(NULL) <= 0) {
         return 27;
+    }
+    time_t epoch = 0;
+    struct tm utc;
+    char timestamp[32];
+    if (gmtime_r(&epoch, &utc) != &utc || utc.tm_year != 70 ||
+        utc.tm_mon != 0 || utc.tm_mday != 1 || utc.tm_wday != 4 ||
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &utc) != 19 ||
+        strcmp(timestamp, "1970-01-01 00:00:00") != 0 ||
+        mktime(&utc) != 0 || difftime(10, 4) != 6.0 || clock() == (clock_t)-1) {
+        return 40;
+    }
+    time_t before_epoch = -1;
+    if (gmtime_r(&before_epoch, &utc) != &utc || utc.tm_year != 69 ||
+        utc.tm_mon != 11 || utc.tm_mday != 31 || utc.tm_hour != 23 ||
+        utc.tm_min != 59 || utc.tm_sec != 59 ||
+        localtime_r(&before_epoch, &utc) != &utc ||
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d%H%M%S%", &utc) != 15 ||
+        strcmp(timestamp, "19691231235959%") != 0) {
+        return 46;
+    }
+    struct tm leap_day = { .tm_mday = 29, .tm_mon = 1, .tm_year = 100 };
+    time_t leap_epoch = mktime(&leap_day);
+    if (leap_epoch == (time_t)-1 || leap_day.tm_year != 100 ||
+        leap_day.tm_mon != 1 || leap_day.tm_mday != 29 ||
+        leap_day.tm_wday != 2 || leap_day.tm_yday != 59) {
+        return 47;
+    }
+    if (strftime(timestamp, 5, "%Y-%m-%d", &utc) != 0 || timestamp[4] != '\0') {
+        return 48;
     }
     sighandler_t old_handler = signal(SIGWINCH, test_signal_handler);
     if (old_handler == SIG_ERR || signal(SIGWINCH, old_handler) != test_signal_handler) {

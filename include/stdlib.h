@@ -19,9 +19,12 @@ _Noreturn void abort(void);
 int abs(int value);
 long labs(long value);
 int atoi(const char *string);
+char *getenv(const char *name);
+int system(const char *command);
 long strtol(const char *restrict string, char **restrict end_pointer, int base);
 unsigned long strtoul(const char *restrict string, char **restrict end_pointer,
     int base);
+double strtod(const char *restrict string, char **restrict end_pointer);
 
 void qsort(void *base, size_t count, size_t size,
     int (*compare)(const void *, const void *));

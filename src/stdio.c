@@ -1,5 +1,8 @@
 #include <errno.h>
 #include <fcntl.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -18,7 +21,9 @@ enum stream_flags {
     STREAM_ERROR = 32,
     STREAM_LAST_READ = 64,
     STREAM_LAST_WRITE = 128,
-    STREAM_UNBUFFERED = 256
+    STREAM_UNBUFFERED = 256,
+    STREAM_LINE_BUFFERED = 512,
+    STREAM_HAS_PUSHBACK = 1024
 };
 
 struct iris_FILE {
@@ -26,6 +31,7 @@ struct iris_FILE {
     unsigned int flags;
     size_t buffer_length;
     size_t buffer_position;
+    unsigned char pushback_character;
     unsigned char buffer[BUFSIZ];
 };
 
@@ -55,6 +61,16 @@ static int stream_active(const FILE *stream)
     /* A nonstandard FILE pointer must be one returned by fopen.  FILE is
      * opaque, so callers cannot construct a valid stream outside this unit. */
     return (stream->flags & STREAM_ACTIVE) != 0;
+}
+
+static int has_newline(const unsigned char *buffer, size_t length)
+{
+    for (size_t index = 0; index < length; index++) {
+        if (buffer[index] == '\n') {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int flush_stream(FILE *stream)
@@ -90,12 +106,16 @@ static int flush_stream(FILE *stream)
 static int synchronize_input(FILE *stream)
 {
     size_t unread = stream->buffer_length - stream->buffer_position;
+    if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+        unread++;
+    }
     if (unread != 0 && lseek(stream->file_descriptor, -(off_t)unread, SEEK_CUR) < 0) {
         stream->flags |= STREAM_ERROR;
         return -1;
     }
     stream->buffer_length = 0;
     stream->buffer_position = 0;
+    stream->flags &= ~STREAM_HAS_PUSHBACK;
     return 0;
 }
 
@@ -168,6 +188,76 @@ FILE *fopen(const char *path, const char *mode)
     return stream;
 }
 
+FILE *tmpfile(void)
+{
+    char path[] = "/tmp/iris-tmp-XXXXXX";
+    /* An unnamed file needs no directory entry: one open, and nothing to unlink. */
+    int descriptor = open("/tmp", O_TMPFILE | O_RDWR, 0600);
+    if (descriptor < 0) {
+        descriptor = mkstemp(path);
+        if (descriptor < 0) {
+            return NULL;
+        }
+        if (unlink(path) != 0) {
+            int saved_error = errno;
+            close(descriptor);
+            errno = saved_error;
+            return NULL;
+        }
+    }
+    FILE *stream = allocate_stream();
+    if (stream == NULL) {
+        close(descriptor);
+        return NULL;
+    }
+    stream->file_descriptor = descriptor;
+    stream->flags |= STREAM_READ | STREAM_WRITE;
+    return stream;
+}
+
+char *tmpnam(char *buffer)
+{
+    static char internal_buffer[L_tmpnam];
+    static uint32_t sequence;
+    static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char path[] = "/tmp/iris-name-XXXXXX";
+    size_t length = sizeof(path) - 1U - 6U;
+
+    /* Like the C library's tmpnam, only check that the name is free; create nothing. */
+    for (unsigned int attempt = 0; attempt < 128; attempt++) {
+        uint32_t value = ++sequence ^ (uint32_t)getpid() ^ (uint32_t)(attempt * 0x9e3779b9U);
+        for (size_t index = 0; index < 6; index++) {
+            value ^= value << 13;
+            value ^= value >> 17;
+            value ^= value << 5;
+            path[length + index] = alphabet[value % 36U];
+        }
+        int descriptor = open(path, O_RDONLY);
+        if (descriptor < 0) {
+            if (errno != ENOENT) {
+                return NULL;
+            }
+            char *result = buffer == NULL ? internal_buffer : buffer;
+            strcpy(result, path);
+            return result;
+        }
+        close(descriptor);
+    }
+    errno = EEXIST;
+    return NULL;
+}
+
+int remove(const char *path)
+{
+    if (unlink(path) == 0) {
+        return 0;
+    }
+    if (errno == EISDIR) {
+        return rmdir(path);
+    }
+    return -1;
+}
+
 int fflush(FILE *stream)
 {
     if (stream == NULL) {
@@ -197,6 +287,26 @@ int fflush(FILE *stream)
     return 0;
 }
 
+int setvbuf(FILE *restrict stream, char *restrict buffer, int mode, size_t size)
+{
+    (void)size;
+    if (!stream_active(stream) || buffer != NULL ||
+        (mode != _IOFBF && mode != _IOLBF && mode != _IONBF)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fflush(stream) == EOF) {
+        return -1;
+    }
+    stream->flags &= ~(STREAM_UNBUFFERED | STREAM_LINE_BUFFERED);
+    if (mode == _IONBF) {
+        stream->flags |= STREAM_UNBUFFERED;
+    } else if (mode == _IOLBF) {
+        stream->flags |= STREAM_LINE_BUFFERED;
+    }
+    return 0;
+}
+
 int fclose(FILE *stream)
 {
     if (!stream_active(stream)) {
@@ -214,7 +324,19 @@ int fclose(FILE *stream)
     stream->flags = 0;
     stream->buffer_length = 0;
     stream->buffer_position = 0;
+    stream->flags &= ~STREAM_HAS_PUSHBACK;
     return failed ? EOF : 0;
+}
+
+FILE *freopen(const char *restrict path, const char *restrict mode,
+    FILE *restrict stream)
+{
+    if (path == NULL || mode == NULL || !stream_active(stream)) {
+        errno = EINVAL;
+        return NULL;
+    }
+    fclose(stream);
+    return fopen(path, mode);
 }
 
 int fseek(FILE *stream, long offset, int whence)
@@ -237,6 +359,7 @@ int fseek(FILE *stream, long offset, int whence)
     }
     stream->buffer_length = 0;
     stream->buffer_position = 0;
+    stream->flags &= ~STREAM_HAS_PUSHBACK;
     stream->flags &= ~(STREAM_EOF | STREAM_LAST_READ | STREAM_LAST_WRITE);
     return 0;
 }
@@ -257,6 +380,9 @@ long ftell(FILE *stream)
     intmax_t logical_position = (intmax_t)current;
     if ((stream->flags & STREAM_LAST_READ) != 0) {
         size_t unread = stream->buffer_length - stream->buffer_position;
+        if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+            unread++;
+        }
         if (unread > (uintmax_t)logical_position) {
             errno = EOVERFLOW;
             stream->flags |= STREAM_ERROR;
@@ -315,10 +441,16 @@ size_t fread(void *buffer, size_t size, size_t count, FILE *stream)
     size_t requested = size * count;
     size_t received = 0;
     unsigned char *destination = buffer;
+    if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+        destination[received++] = stream->pushback_character;
+        stream->flags &= ~STREAM_HAS_PUSHBACK;
+    }
     size_t buffered = stream->buffer_length - stream->buffer_position;
-    if (buffered >= requested) {
-        memcpy(destination, stream->buffer + stream->buffer_position, requested);
-        stream->buffer_position += requested;
+    size_t remaining_request = requested - received;
+    if (buffered >= remaining_request) {
+        memcpy(destination + received, stream->buffer + stream->buffer_position,
+            remaining_request);
+        stream->buffer_position += remaining_request;
         return count;
     }
     while (received < requested) {
@@ -399,6 +531,10 @@ size_t fwrite(const void *buffer, size_t size, size_t count, FILE *stream)
     if (available > requested && (stream->flags & STREAM_UNBUFFERED) == 0) {
         memcpy(stream->buffer + stream->buffer_length, source, requested);
         stream->buffer_length += requested;
+        if ((stream->flags & STREAM_LINE_BUFFERED) != 0 &&
+            has_newline(source, requested) && flush_stream(stream) != 0) {
+            return 0;
+        }
         return count;
     }
     while (written < requested) {
@@ -427,7 +563,9 @@ size_t fwrite(const void *buffer, size_t size, size_t count, FILE *stream)
         stream->buffer_length += chunk;
         written += chunk;
         if (stream->buffer_length == BUFSIZ ||
-            (stream->flags & STREAM_UNBUFFERED) != 0) {
+            (stream->flags & STREAM_UNBUFFERED) != 0 ||
+            ((stream->flags & STREAM_LINE_BUFFERED) != 0 &&
+                has_newline(source + written - chunk, chunk))) {
             if (flush_stream(stream) != 0) {
                 written -= chunk;
                 break;
@@ -450,6 +588,10 @@ int fgetc(FILE *stream)
     if ((stream->flags & STREAM_LAST_READ) == 0) {
         stream->flags = (stream->flags & ~STREAM_LAST_WRITE) | STREAM_LAST_READ;
     }
+    if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+        stream->flags &= ~STREAM_HAS_PUSHBACK;
+        return stream->pushback_character;
+    }
     if (stream->buffer_position == stream->buffer_length) {
         ssize_t result;
         do {
@@ -467,6 +609,33 @@ int fgetc(FILE *stream)
         stream->buffer_position = 0;
     }
     return stream->buffer[stream->buffer_position++];
+}
+
+int getc(FILE *stream)
+{
+    return fgetc(stream);
+}
+
+int ungetc(int character, FILE *stream)
+{
+    if (character == EOF) {
+        return EOF;
+    }
+    if (!stream_active(stream) || (stream->flags & STREAM_READ) == 0 ||
+        (stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+        errno = EINVAL;
+        if (stream_active(stream)) stream->flags |= STREAM_ERROR;
+        return EOF;
+    }
+    if ((stream->flags & STREAM_LAST_WRITE) != 0 && fflush(stream) == EOF) {
+        return EOF;
+    }
+    if ((stream->flags & STREAM_LAST_READ) == 0) {
+        stream->flags = (stream->flags & ~STREAM_LAST_WRITE) | STREAM_LAST_READ;
+    }
+    stream->pushback_character = (unsigned char)character;
+    stream->flags = (stream->flags | STREAM_HAS_PUSHBACK) & ~STREAM_EOF;
+    return stream->pushback_character;
 }
 
 static inline size_t newline_offset(const unsigned char *buffer, size_t length);
@@ -500,6 +669,15 @@ ssize_t __iris_getline_impl(char **restrict line, size_t *restrict capacity,
     }
 
     size_t length = 0;
+    if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+        unsigned char character = stream->pushback_character;
+        stream->flags &= ~STREAM_HAS_PUSHBACK;
+        (*line)[length++] = (char)character;
+        if (character == '\n') {
+            (*line)[length] = '\0';
+            return (ssize_t)length;
+        }
+    }
     for (;;) {
         if (stream->buffer_position == stream->buffer_length) {
             ssize_t result;
@@ -566,7 +744,8 @@ int fputc(int character, FILE *stream)
     }
     stream->buffer[stream->buffer_length++] = (unsigned char)character;
     if (stream->buffer_length == BUFSIZ ||
-        (stream->flags & STREAM_UNBUFFERED) != 0) {
+        (stream->flags & STREAM_UNBUFFERED) != 0 ||
+        ((stream->flags & STREAM_LINE_BUFFERED) != 0 && character == '\n')) {
         if (flush_stream(stream) != 0) return EOF;
     }
     return (unsigned char)character;
@@ -574,6 +753,25 @@ int fputc(int character, FILE *stream)
 
 static inline size_t newline_offset(const unsigned char *buffer, size_t length)
 {
+#if defined(__SSE2__)
+    /* Sixteen bytes per step; the first set bit of the mask locates the newline. */
+    const __m128i newlines_vector = _mm_set1_epi8('\n');
+    size_t offset = 0;
+
+    while (length - offset >= 16U) {
+        unsigned int mask = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i *)(buffer + offset)), newlines_vector));
+
+        if (mask != 0) {
+            return offset + (size_t)__builtin_ctz(mask);
+        }
+        offset += 16U;
+    }
+    while (offset < length && buffer[offset] != '\n') {
+        offset++;
+    }
+    return offset;
+#else
     const size_t ones = SIZE_MAX / UCHAR_MAX;
     const size_t high_bits = ones * (UCHAR_MAX / 2U + 1U);
     const size_t newlines = ones * (size_t)'\n';
@@ -592,6 +790,7 @@ static inline size_t newline_offset(const unsigned char *buffer, size_t length)
         offset++;
     }
     return offset;
+#endif
 }
 
 char *fgets(char *buffer, int count, FILE *stream)
@@ -621,6 +820,15 @@ char *fgets(char *buffer, int count, FILE *stream)
     size_t length = 0;
     size_t limit = (size_t)(count - 1);
     while (length < limit) {
+        if ((stream->flags & STREAM_HAS_PUSHBACK) != 0) {
+            unsigned char character = stream->pushback_character;
+            stream->flags &= ~STREAM_HAS_PUSHBACK;
+            buffer[length++] = (char)character;
+            if (character == '\n') {
+                break;
+            }
+            continue;
+        }
         if (stream->buffer_position == stream->buffer_length) {
             ssize_t result;
             do {
@@ -1078,6 +1286,236 @@ static void emit_integer(struct format_output *output, uintmax_t value,
     }
 }
 
+static void append_local_character(char *buffer, size_t *length, char character)
+{
+    buffer[(*length)++] = character;
+}
+
+static void append_local_number(char *buffer, size_t *length,
+    unsigned int number, unsigned int width)
+{
+    char digits[12];
+    unsigned int digit_count = 0;
+    do {
+        digits[digit_count++] = (char)('0' + number % 10U);
+        number /= 10U;
+    } while (number != 0);
+    while (digit_count < width) {
+        append_local_character(buffer, length, '0');
+        width--;
+    }
+    while (digit_count != 0) {
+        append_local_character(buffer, length, digits[--digit_count]);
+    }
+}
+
+static void normalize_decimal(long double *value, int *exponent)
+{
+    *exponent = 0;
+    if (*value == 0.0L) {
+        return;
+    }
+    while (*value >= 10.0L && *exponent < 400) {
+        *value /= 10.0L;
+        (*exponent)++;
+    }
+    while (*value < 1.0L && *exponent > -400) {
+        *value *= 10.0L;
+        (*exponent)--;
+    }
+}
+
+static void generate_significant_digits(long double value, char *digits,
+    size_t count, int *exponent)
+{
+    normalize_decimal(&value, exponent);
+    for (size_t index = 0; index <= count; index++) {
+        int digit = (int)value;
+        if (digit < 0) digit = 0;
+        if (digit > 9) digit = 9;
+        if (index < count) {
+            digits[index] = (char)('0' + digit);
+        } else {
+            digits[count] = (char)('0' + digit);
+        }
+        value = (value - digit) * 10.0L;
+    }
+    if (digits[count] >= '5') {
+        size_t index = count;
+        while (index != 0 && digits[index - 1] == '9') {
+            digits[--index] = '0';
+        }
+        if (index == 0) {
+            digits[0] = '1';
+            for (size_t digit_index = 1; digit_index < count; digit_index++) {
+                digits[digit_index] = '0';
+            }
+            (*exponent)++;
+        } else {
+            digits[index - 1]++;
+        }
+    }
+}
+
+static void emit_float_field(struct format_output *output, double input,
+    char conversion, int width, int precision, int precision_set,
+    int left, int zero, int alternate, int plus, int space)
+{
+    char body[800];
+    char digits[700];
+    size_t body_length = 0;
+    int uppercase = conversion == 'F' || conversion == 'E' || conversion == 'G';
+    char kind = (char)(conversion | 0x20);
+    int negative = __builtin_signbit(input);
+    long double magnitude = negative ? -(long double)input : (long double)input;
+    char sign = negative ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
+
+    if (!precision_set) {
+        precision = 6;
+    }
+    if (kind == 'g' && precision == 0) {
+        precision = 1;
+    }
+    if (precision < 0 || precision > 300) {
+        errno = EOVERFLOW;
+        output->failed = 1;
+        return;
+    }
+
+    if (__builtin_isnan(input) || __builtin_isinf(input)) {
+        const char *special = __builtin_isnan(input) ? "nan" : "inf";
+        for (size_t index = 0; special[index] != '\0'; index++) {
+            body[body_length++] = uppercase
+                ? (char)(special[index] - ('a' - 'A')) : special[index];
+        }
+    } else if (kind == 'e') {
+        int exponent;
+        size_t significant_count = (size_t)precision + 1;
+        generate_significant_digits(magnitude, digits, significant_count, &exponent);
+        body[body_length++] = digits[0];
+        if (precision != 0 || alternate) {
+            body[body_length++] = '.';
+            for (size_t index = 0; index < (size_t)precision; index++) {
+                body[body_length++] = digits[index + 1];
+            }
+        }
+        body[body_length++] = uppercase ? 'E' : 'e';
+        body[body_length++] = exponent < 0 ? '-' : '+';
+        unsigned int exponent_magnitude = (unsigned int)(exponent < 0
+            ? -exponent : exponent);
+        append_local_number(body, &body_length, exponent_magnitude, 2);
+    } else if (kind == 'f') {
+        int exponent;
+        normalize_decimal(&magnitude, &exponent);
+        int integer_digits = exponent + 1;
+        int places = integer_digits + precision;
+        int small_round_up = places == 0 && magnitude >= 5.0L;
+        if (places <= 0) {
+            if (small_round_up && precision == 0) {
+                body[body_length++] = '1';
+            } else {
+                body[body_length++] = '0';
+                if (precision != 0 || alternate) {
+                    body[body_length++] = '.';
+                    size_t zero_count = (size_t)precision;
+                    for (size_t index = 0; index < zero_count; index++) {
+                        body[body_length++] = small_round_up && index + 1 == zero_count
+                            ? '1' : '0';
+                    }
+                }
+            }
+        } else {
+            size_t significant_count = (size_t)places;
+            generate_significant_digits(magnitude, digits, significant_count,
+                &exponent);
+            integer_digits = exponent + 1;
+            if (integer_digits <= 0) {
+                body[body_length++] = '0';
+            } else {
+                for (int index = 0; index < integer_digits; index++) {
+                    body[body_length++] = (size_t)index < significant_count
+                        ? digits[index] : '0';
+                }
+            }
+            if (precision != 0 || alternate) {
+                body[body_length++] = '.';
+                int leading_zeroes = integer_digits < 0 ? -integer_digits : 0;
+                for (int index = 0; index < precision; index++) {
+                    int digit_index = index - leading_zeroes + (integer_digits > 0
+                        ? integer_digits : 0);
+                    body[body_length++] = digit_index < 0 ||
+                        (size_t)digit_index >= significant_count
+                        ? '0' : digits[digit_index];
+                }
+            }
+        }
+    } else {
+        size_t significant_count = (size_t)precision;
+        int exponent;
+        generate_significant_digits(magnitude, digits, significant_count, &exponent);
+        int scientific = exponent < -4 || exponent >= precision;
+        if (scientific) {
+            body[body_length++] = digits[0];
+            size_t fraction_count = significant_count - 1;
+            while (!alternate && fraction_count != 0 && digits[fraction_count] == '0') {
+                fraction_count--;
+            }
+            if (fraction_count != 0 || alternate) {
+                body[body_length++] = '.';
+                for (size_t index = 0; index < fraction_count; index++) {
+                    body[body_length++] = digits[index + 1];
+                }
+            }
+            body[body_length++] = uppercase ? 'E' : 'e';
+            body[body_length++] = exponent < 0 ? '-' : '+';
+            unsigned int exponent_magnitude = (unsigned int)(exponent < 0
+                ? -exponent : exponent);
+            append_local_number(body, &body_length, exponent_magnitude, 2);
+        } else {
+            int integer_digits = exponent + 1;
+            int fraction_count = precision - integer_digits;
+            if (fraction_count < 0) fraction_count = 0;
+            while (!alternate && fraction_count > 0) {
+                int digit_index = integer_digits + fraction_count - 1;
+                if (digit_index >= 0 && (size_t)digit_index < significant_count &&
+                    digits[digit_index] == '0') {
+                    fraction_count--;
+                } else {
+                    break;
+                }
+            }
+            if (integer_digits <= 0) {
+                body[body_length++] = '0';
+            } else {
+                for (int index = 0; index < integer_digits; index++) {
+                    body[body_length++] = (size_t)index < significant_count
+                        ? digits[index] : '0';
+                }
+            }
+            if (fraction_count != 0 || alternate) {
+                body[body_length++] = '.';
+                int leading_zeroes = integer_digits < 0 ? -integer_digits : 0;
+                for (int index = 0; index < fraction_count; index++) {
+                    int digit_index = index - leading_zeroes +
+                        (integer_digits > 0 ? integer_digits : 0);
+                    body[body_length++] = digit_index < 0 ||
+                        (size_t)digit_index >= significant_count
+                        ? '0' : digits[digit_index];
+                }
+            }
+        }
+    }
+
+    size_t content_length = body_length + (sign != '\0');
+    size_t padding = width > 0 && (size_t)width > content_length
+        ? (size_t)width - content_length : 0;
+    if (!left && !zero) emit_repeat(output, ' ', padding);
+    if (sign != '\0') emit_character(output, sign);
+    if (!left && zero) emit_repeat(output, '0', padding);
+    emit_buffer_string(output, body, body_length);
+    if (left) emit_repeat(output, ' ', padding);
+}
+
 static int render_format(struct format_output *output, const char *format,
     va_list *arguments)
 {
@@ -1213,6 +1651,11 @@ static int render_format(struct format_output *output, const char *format,
             const char *string = va_arg(*arguments, const char *);
             if (string == NULL) string = "(null)";
             emit_string_field(output, string, width, left, precision, precision_set);
+        } else if (conversion == 'f' || conversion == 'F' || conversion == 'e' ||
+            conversion == 'E' || conversion == 'g' || conversion == 'G') {
+            double value = va_arg(*arguments, double);
+            emit_float_field(output, value, conversion, width, precision,
+                precision_set, left, zero, alternate, plus, space);
         } else if (conversion == '%') {
             size_t padding = width > 1 ? (size_t)width - 1 : 0;
             if (!left) emit_repeat(output, ' ', padding);
@@ -1268,6 +1711,21 @@ int snprintf(char *buffer, size_t size, const char *format, ...)
     va_list arguments;
     va_start(arguments, format);
     int result = vsnprintf(buffer, size, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+int vsprintf(char *restrict buffer, const char *restrict format,
+    va_list arguments)
+{
+    return vsnprintf(buffer, SIZE_MAX, format, arguments);
+}
+
+int sprintf(char *restrict buffer, const char *restrict format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vsprintf(buffer, format, arguments);
     va_end(arguments);
     return result;
 }

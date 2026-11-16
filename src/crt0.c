@@ -5,6 +5,8 @@
 extern int main(int argc, char **argv, char **envp);
 extern int __iris_init_vdso(uintptr_t image_address);
 
+char **environ;
+
 #define IRIS_AT_NULL 0
 #define IRIS_AT_SYSINFO_EHDR 33
 
@@ -67,6 +69,7 @@ _Noreturn void _start_c(long *stack)
     int argc = (int)stack[0];
     char **argv = (char **)(stack + 1);
     char **envp = argv + argc + 1;
+    environ = envp;
     uintptr_t *auxiliary = (uintptr_t *)(envp + 1);
     while (auxiliary[0] != IRIS_AT_NULL) {
         if (auxiliary[0] == IRIS_AT_SYSINFO_EHDR) {

@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <limits.h>
+#include <float.h>
 #include <stdint.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +31,8 @@ static size_t slab_remaining = 0;
 static void (*exit_handlers[32])(void);
 static size_t exit_handler_count;
 static int exit_handlers_running;
+
+extern char **environ __attribute__((weak));
 
 static inline size_t size_to_class(size_t size)
 {
@@ -229,6 +233,36 @@ _Noreturn void _Exit(int status)
 _Noreturn void abort(void)
 {
     _exit(134);
+}
+
+char *getenv(const char *name)
+{
+    if (name == NULL || *name == '\0' || &environ == NULL || environ == NULL) {
+        return NULL;
+    }
+    for (char **entry = environ; *entry != NULL; entry++) {
+        /* Most entries stop at the first byte; only matching prefixes are walked. */
+        const char *candidate = *entry;
+        const char *key = name;
+
+        while (*key != '\0' && *candidate == *key) {
+            candidate++;
+            key++;
+        }
+        if (*key == '\0' && *candidate == '=') {
+            return (char *)candidate + 1;
+        }
+    }
+    return NULL;
+}
+
+int system(const char *command)
+{
+    if (command == NULL) {
+        return 0;
+    }
+    errno = ENOSYS;
+    return -1;
 }
 
 int abs(int value)
@@ -459,6 +493,231 @@ long strtol(const char *restrict string, char **restrict end_pointer, int base)
 int atoi(const char *string)
 {
     return (int)strtol(string, NULL, 10);
+}
+
+static int ascii_lower(int character)
+{
+    if (character >= 'A' && character <= 'Z') {
+        return character + ('a' - 'A');
+    }
+    return character;
+}
+
+static int match_ascii_word(const char *string, const char *word)
+{
+    while (*word != '\0') {
+        if (ascii_lower((unsigned char)*string) != *word) {
+            return 0;
+        }
+        string++;
+        word++;
+    }
+    return 1;
+}
+
+static int bounded_exponent_add(int left, int right)
+{
+    if (right > 0 && left > 10000 - right) {
+        return 10000;
+    }
+    if (right < 0 && left < -10000 - right) {
+        return -10000;
+    }
+    return left + right;
+}
+
+static int parse_float_exponent(const char **cursor, char marker_lower,
+    char marker_upper)
+{
+    const char *start = *cursor;
+    if (*start != marker_lower && *start != marker_upper) {
+        return 0;
+    }
+
+    const char *position = start + 1;
+    int negative = 0;
+    if (*position == '-' || *position == '+') {
+        negative = *position == '-';
+        position++;
+    }
+    if (*position < '0' || *position > '9') {
+        return 0;
+    }
+
+    int exponent = 0;
+    do {
+        int digit = *position++ - '0';
+        if (exponent < 10000) {
+            exponent = exponent > (10000 - digit) / 10
+                ? 10000 : exponent * 10 + digit;
+        }
+    } while (*position >= '0' && *position <= '9');
+
+    *cursor = position;
+    return negative ? -exponent : exponent;
+}
+
+double strtod(const char *restrict string, char **restrict end_pointer)
+{
+    const char *cursor = string;
+    while (is_space_char((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    int negative = 0;
+    if (*cursor == '-' || *cursor == '+') {
+        negative = *cursor == '-';
+        cursor++;
+    }
+
+    if (match_ascii_word(cursor, "infinity")) {
+        cursor += 8;
+        if (end_pointer != NULL) *end_pointer = (char *)cursor;
+        double result = __builtin_huge_val();
+        return negative ? -result : result;
+    }
+    if (match_ascii_word(cursor, "inf")) {
+        cursor += 3;
+        if (end_pointer != NULL) *end_pointer = (char *)cursor;
+        double result = __builtin_huge_val();
+        return negative ? -result : result;
+    }
+    if (match_ascii_word(cursor, "nan")) {
+        cursor += 3;
+        if (*cursor == '(') {
+            const char *payload = cursor + 1;
+            while ((*payload >= 'a' && *payload <= 'z') ||
+                (*payload >= 'A' && *payload <= 'Z') ||
+                (*payload >= '0' && *payload <= '9') || *payload == '_') {
+                payload++;
+            }
+            if (*payload == ')') {
+                cursor = payload + 1;
+            }
+        }
+        if (end_pointer != NULL) *end_pointer = (char *)cursor;
+        double result = __builtin_nan("");
+        return negative ? -result : result;
+    }
+
+    int hexadecimal = cursor[0] == '0' &&
+        (cursor[1] == 'x' || cursor[1] == 'X');
+    if (hexadecimal) {
+        const char *probe = cursor + 2;
+        int has_hex_digit = 0;
+        while (digit_value((unsigned char)*probe) >= 0 &&
+            digit_value((unsigned char)*probe) < 16) {
+            has_hex_digit = 1;
+            probe++;
+        }
+        if (*probe == '.') {
+            probe++;
+            while (digit_value((unsigned char)*probe) >= 0 &&
+                digit_value((unsigned char)*probe) < 16) {
+                has_hex_digit = 1;
+                probe++;
+            }
+        }
+        hexadecimal = has_hex_digit;
+        if (hexadecimal) {
+            cursor += 2;
+        }
+    }
+
+    struct lconv *conventions = localeconv();
+    char decimal_point = conventions != NULL && conventions->decimal_point != NULL
+        ? conventions->decimal_point[0] : '.';
+    long double significand = 0.0L;
+    int exponent_adjustment = 0;
+    int significant_digits = 0;
+    int saw_digit = 0;
+    int saw_significant = 0;
+    int after_decimal = 0;
+    int radix = hexadecimal ? 16 : 10;
+    int exponent_step = hexadecimal ? 4 : 1;
+
+    for (;;) {
+        if (*cursor == decimal_point && !after_decimal) {
+            after_decimal = 1;
+            cursor++;
+            continue;
+        }
+
+        int digit = hexadecimal
+            ? digit_value((unsigned char)*cursor)
+            : ((*cursor >= '0' && *cursor <= '9') ? *cursor - '0' : -1);
+        if (digit < 0 || digit >= radix) {
+            break;
+        }
+        saw_digit = 1;
+        if (saw_significant || digit != 0) {
+            saw_significant = 1;
+            if (significant_digits < 19) {
+                significand = significand * (long double)radix + digit;
+                significant_digits++;
+                if (after_decimal) {
+                    exponent_adjustment = bounded_exponent_add(
+                        exponent_adjustment, -exponent_step);
+                }
+            } else if (!after_decimal) {
+                exponent_adjustment = bounded_exponent_add(
+                    exponent_adjustment, exponent_step);
+            }
+        } else if (after_decimal) {
+            exponent_adjustment = bounded_exponent_add(
+                exponent_adjustment, -exponent_step);
+        }
+        cursor++;
+    }
+
+    if (!saw_digit) {
+        if (end_pointer != NULL) *end_pointer = (char *)string;
+        return 0.0;
+    }
+
+    const char *exponent_cursor = cursor;
+    int explicit_exponent = parse_float_exponent(&exponent_cursor,
+        hexadecimal ? 'p' : 'e', hexadecimal ? 'P' : 'E');
+    cursor = exponent_cursor;
+    int exponent = bounded_exponent_add(exponent_adjustment, explicit_exponent);
+    if (end_pointer != NULL) *end_pointer = (char *)cursor;
+
+    if (significand == 0.0L) {
+        return negative ? -0.0 : 0.0;
+    }
+
+    int exponent_limit = hexadecimal ? 1200 : 400;
+    if (exponent > exponent_limit) {
+        errno = ERANGE;
+        double result = __builtin_huge_val();
+        return negative ? -result : result;
+    }
+    if (exponent < -exponent_limit) {
+        errno = ERANGE;
+        return negative ? -0.0 : 0.0;
+    }
+
+    long double scaled = significand;
+    long double scale = hexadecimal ? 2.0L : 10.0L;
+    while (exponent > 0) {
+        scaled *= scale;
+        exponent--;
+    }
+    while (exponent < 0) {
+        scaled /= scale;
+        exponent++;
+    }
+
+    if (scaled > (long double)DBL_MAX) {
+        errno = ERANGE;
+        double result = __builtin_huge_val();
+        return negative ? -result : result;
+    }
+    double result = (double)scaled;
+    if (result == 0.0 || result < DBL_MIN) {
+        errno = ERANGE;
+    }
+    return negative ? -result : result;
 }
 
 static void swap_bytes(unsigned char *left, unsigned char *right, size_t size)

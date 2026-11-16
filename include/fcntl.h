@@ -8,6 +8,8 @@
 #define O_EXCL 0200
 #define O_TRUNC 01000
 #define O_APPEND 02000
+#define O_DIRECTORY 0200000
+#define O_TMPFILE (020000000 | O_DIRECTORY)
 
 int open(const char *path, int flags, ...);
 

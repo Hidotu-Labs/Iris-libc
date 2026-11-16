@@ -256,6 +256,7 @@ static int check_page_edge_strings(void)
 static int check_extended_strings(void)
 {
     const char text[] = "abcabc";
+    char buffer[16];
 
     if (strchr(text, 'b') != text + 1 || strchr(text, '\0') != text + 6 ||
         strchr(text, 'z') != NULL || strchr(text, 0x161) != text) {
@@ -269,6 +270,28 @@ static int check_extended_strings(void)
     if (strcmp(strerror(ENOENT), "No such file or directory") != 0 ||
         strcmp(strerror(-1), "Unknown error") != 0) {
         return 3;
+    }
+    if (strcpy(buffer, "iris") != buffer || strcat(buffer, "-libc") != buffer ||
+        strcmp(buffer, "iris-libc") != 0 || strncat(buffer, "-test", 2) != buffer ||
+        strcmp(buffer, "iris-libc-t") != 0) {
+        return 4;
+    }
+    memset(buffer, 0xa5, sizeof(buffer));
+    if (strncpy(buffer, "xy", 5) != buffer || buffer[0] != 'x' ||
+        buffer[1] != 'y' || buffer[2] != '\0' || buffer[4] != '\0' ||
+        buffer[5] != (char)0xa5) {
+        return 5;
+    }
+    if (strrchr(text, 'b') != text + 4 || strrchr(text, '\0') != text + 6 ||
+        strrchr(text, 'z') != NULL || memchr(text, 'c', sizeof(text)) != text + 2 ||
+        memchr(text, 'z', sizeof(text)) != NULL) {
+        return 6;
+    }
+    if (strpbrk("iris-libc", "xyz-") != "iris-libc" + 4 ||
+        strspn("abcde", "abc") != 3 || strcspn("abcde", "de") != 3 ||
+        strspn("abc", "") != 0 || strcspn("abc", "") != 3 ||
+        strcoll("abc", "abd") >= 0 || strcoll("abc", "abc") != 0) {
+        return 7;
     }
     return 0;
 }
@@ -344,6 +367,20 @@ static int print_stream_variadic(FILE *stream, const char *format, ...)
 static int check_stdio(void)
 {
     char buffer[64];
+    if (snprintf(buffer, sizeof(buffer), "%.3f %.4g", 1.25, 12.345) != 11 ||
+        strcmp(buffer, "1.250 12.35") != 0 || sprintf(buffer, "%g", 1.5) != 3 ||
+        strcmp(buffer, "1.5") != 0) {
+        return 14;
+    }
+    if (snprintf(buffer, sizeof(buffer), "%.0f %.2f", 0.11, 0.009) != 6 ||
+        strcmp(buffer, "0 0.01") != 0 || snprintf(buffer, sizeof(buffer), "%.0f", 0.5) != 1 ||
+        strcmp(buffer, "1") != 0) {
+        return 15;
+    }
+    if (sprintf(buffer, "[%s:%d]", "iris", 7) != 8 ||
+        strcmp(buffer, "[iris:7]") != 0) {
+        return 13;
+    }
     if (stdin == NULL || stdout == NULL || stderr == NULL) {
         return 12;
     }
@@ -398,7 +435,117 @@ static int check_file_streams(void)
     char actual[sizeof(expected)];
     unlink(path);
 
+    char temporary_name[L_tmpnam];
+    char *temporary_path = tmpnam(temporary_name);
+    if (temporary_path != temporary_name) {
+        return 34;
+    }
+    FILE *named_temporary = fopen(temporary_path, "w");
+    if (named_temporary == NULL || fclose(named_temporary) != 0 ||
+        remove(temporary_path) != 0) {
+        if (named_temporary != NULL) fclose(named_temporary);
+        return 34;
+    }
+
+    char source_path[] = "/tmp/iris-mkstemp-XXXXXX";
+    int temporary_descriptor = mkstemp(source_path);
+    if (temporary_descriptor < 0 ||
+        write(temporary_descriptor, "rename", 6) != 6 ||
+        close(temporary_descriptor) != 0) {
+        if (temporary_descriptor >= 0) close(temporary_descriptor);
+        unlink(source_path);
+        return 39;
+    }
+    char destination_path[sizeof(source_path) + 8];
+    strcpy(destination_path, source_path);
+    strcat(destination_path, ".moved");
+    if (rename(source_path, destination_path) != 0) {
+        unlink(source_path);
+        return 39;
+    }
+    FILE *renamed = fopen(destination_path, "r");
+    char renamed_contents[7];
+    if (renamed == NULL || fread(renamed_contents, 1, 6, renamed) != 6 ||
+        memcmp(renamed_contents, "rename", 6) != 0 || fclose(renamed) != 0 ||
+        remove(destination_path) != 0) {
+        if (renamed != NULL) fclose(renamed);
+        unlink(destination_path);
+        return 39;
+    }
+
+    FILE *temporary = tmpfile();
+    if (temporary == NULL) {
+        return 33;
+    }
+    if (setvbuf(temporary, NULL, _IOLBF, BUFSIZ) != 0) {
+        fclose(temporary);
+        return 34;
+    }
+    if (fputs("ab", temporary) == EOF) {
+        fclose(temporary);
+        return 35;
+    }
+    rewind(temporary);
+    if (getc(temporary) != 'a') {
+        fclose(temporary);
+        return 36;
+    }
+    if (ungetc('Q', temporary) != 'Q') {
+        fclose(temporary);
+        return 37;
+    }
+    if (fgetc(temporary) != 'Q' || ungetc('Q', temporary) != 'Q') {
+        fclose(temporary);
+        return 38;
+    }
+    char pushed_back;
+    if (fread(&pushed_back, 1, 1, temporary) != 1 || pushed_back != 'Q' ||
+        getc(temporary) != 'b' || fclose(temporary) != 0) {
+        if (temporary != NULL) fclose(temporary);
+        return 40;
+    }
+
+    temporary = tmpfile();
+    char input_line[16];
+    if (temporary == NULL || fputs("bc\nrest", temporary) == EOF) {
+        if (temporary != NULL) fclose(temporary);
+        return 41;
+    }
+    rewind(temporary);
+    if (fgetc(temporary) != 'b' || ungetc('X', temporary) != 'X' ||
+        fgets(input_line, sizeof(input_line), temporary) != input_line ||
+        strcmp(input_line, "Xc\n") != 0 || ungetc('Y', temporary) != 'Y') {
+        fclose(temporary);
+        return 41;
+    }
+    char *line = NULL;
+    size_t line_capacity = 0;
+    ssize_t line_length = getline(&line, &line_capacity, temporary);
+    if (line_length != 5 || strcmp(line, "Yrest") != 0) {
+        free(line);
+        fclose(temporary);
+        return 42;
+    }
+    free(line);
+    if (fclose(temporary) != 0) {
+        return 43;
+    }
+
     FILE *stream = fopen(path, "w");
+    if (stream == NULL || fputs("probe", stream) == EOF) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 32;
+    }
+    stream = freopen(path, "rb", stream);
+    if (stream == NULL || getc(stream) != 'p' || fgetc(stream) != 'r' ||
+        fclose(stream) != 0) {
+        if (stream != NULL) fclose(stream);
+        unlink(path);
+        return 32;
+    }
+
+    stream = fopen(path, "w");
     if (stream == NULL) {
         unlink(path);
         return 1;

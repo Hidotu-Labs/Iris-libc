@@ -26,15 +26,27 @@ extern int iris_fprintf(iris_FILE *stream, const char *format, ...);
 extern int iris_vfprintf(iris_FILE *stream, const char *format, va_list arguments);
 extern int iris_snprintf(char *buffer, size_t size, const char *format, ...);
 extern int iris_vsnprintf(char *buffer, size_t size, const char *format, va_list arguments);
+extern int iris_sprintf(char *restrict buffer, const char *restrict format, ...);
+extern int iris_vsprintf(char *restrict buffer, const char *restrict format,
+    va_list arguments);
 extern iris_FILE *iris_fopen(const char *path, const char *mode);
+extern iris_FILE *iris_freopen(const char *restrict path,
+    const char *restrict mode, iris_FILE *restrict stream);
+extern iris_FILE *iris_tmpfile(void);
+extern char *iris_tmpnam(char *buffer);
 extern int iris_fclose(iris_FILE *stream);
 extern int iris_fflush(iris_FILE *stream);
+extern int iris_setvbuf(iris_FILE *restrict stream, char *restrict buffer,
+    int mode, size_t size);
+extern int iris_remove(const char *path);
 extern int iris_fseek(iris_FILE *stream, long offset, int whence);
 extern long iris_ftell(iris_FILE *stream);
 extern void iris_rewind(iris_FILE *stream);
 extern size_t iris_fread(void *buffer, size_t size, size_t count, iris_FILE *stream);
 extern size_t iris_fwrite(const void *buffer, size_t size, size_t count, iris_FILE *stream);
 extern int iris_fgetc(iris_FILE *stream);
+extern int iris_getc(iris_FILE *stream);
+extern int iris_ungetc(int character, iris_FILE *stream);
 extern int iris_fputc(int character, iris_FILE *stream);
 extern char *iris_fgets(char *buffer, int count, iris_FILE *stream);
 extern int iris_fputs(const char *string, iris_FILE *stream);
@@ -143,6 +155,52 @@ static int iris_snprintf_call(void *opaque)
     struct iris_context *context = opaque;
     return iris_snprintf(context->output, sizeof(context->output),
         "%s:%08d:%#x", context->text, 1234567, 0xabcdeU);
+}
+
+static int host_sprintf_call(void *opaque)
+{
+    struct host_context *context = opaque;
+    return sprintf(context->output, "%s:%08d:%#x",
+        context->text, 1234567, 0xabcdeU);
+}
+
+static int iris_sprintf_call(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_sprintf(context->output, "%s:%08d:%#x",
+        context->text, 1234567, 0xabcdeU);
+}
+
+static int host_vsprintf_call(char *buffer, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vsprintf(buffer, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int iris_vsprintf_call(char *buffer, const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = iris_vsprintf(buffer, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+static int host_vsprintf_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return host_vsprintf_call(context->output, "%s:%08d:%#x",
+        context->text, 1234567, 0xabcdeU);
+}
+
+static int iris_vsprintf_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_vsprintf_call(context->output, "%s:%08d:%#x",
+        context->text, 1234567, 0xabcdeU);
 }
 
 static int host_vsnprintf_call(char *buffer, size_t size, const char *format, ...)
@@ -257,6 +315,31 @@ static int iris_fgetc_operation(void *opaque)
 {
     struct iris_context *context = opaque;
     return iris_fgetc(context->stream);
+}
+
+static int host_getc_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return getc(context->stream);
+}
+
+static int iris_getc_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_getc(context->stream);
+}
+
+static int host_ungetc_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return ungetc('q', context->stream) == EOF ? EOF : getc(context->stream);
+}
+
+static int iris_ungetc_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_ungetc('q', context->stream) == EOF
+        ? EOF : iris_getc(context->stream);
 }
 
 static int host_fputc_operation(void *opaque)
@@ -395,6 +478,96 @@ static int iris_open_close_operation(void *unused)
     (void)unused;
     iris_FILE *stream = iris_fopen("/dev/null", "w");
     return stream != NULL && iris_fclose(stream) == 0 ? 1 : -1;
+}
+
+static int host_tmpfile_operation(void *unused)
+{
+    (void)unused;
+    FILE *stream = tmpfile();
+    return stream != NULL && fclose(stream) == 0 ? 1 : -1;
+}
+
+static int iris_tmpfile_operation(void *unused)
+{
+    (void)unused;
+    iris_FILE *stream = iris_tmpfile();
+    return stream != NULL && iris_fclose(stream) == 0 ? 1 : -1;
+}
+
+static int host_tmpnam_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    char *result = tmpnam(context->output);
+    return result != NULL ? (unsigned char)result[0] : -1;
+}
+
+static int iris_tmpnam_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    char *result = iris_tmpnam(context->output);
+    return result != NULL ? (unsigned char)result[0] : -1;
+}
+
+static int host_remove_operation(void *opaque)
+{
+    (void)opaque;
+    char path[L_tmpnam];
+    if (tmpnam(path) == NULL) return -1;
+    FILE *stream = fopen(path, "w");
+    if (stream == NULL) {
+        remove(path);
+        return -1;
+    }
+    if (fclose(stream) != 0) {
+        remove(path);
+        return -1;
+    }
+    return remove(path);
+}
+
+static int iris_remove_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    char path[L_tmpnam];
+    (void)context;
+    if (iris_tmpnam(path) == NULL) return -1;
+    iris_FILE *stream = iris_fopen(path, "w");
+    if (stream == NULL || iris_fclose(stream) != 0) {
+        if (stream != NULL) iris_fclose(stream);
+        iris_remove(path);
+        return -1;
+    }
+    return iris_remove(path);
+}
+
+static int host_freopen_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    FILE *stream = freopen("/dev/null", "w", context->stream);
+    if (stream == NULL) return -1;
+    context->stream = stream;
+    return 0;
+}
+
+static int iris_freopen_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    iris_FILE *stream = iris_freopen("/dev/null", "w", context->stream);
+    if (stream == NULL) return -1;
+    context->stream = stream;
+    return 0;
+}
+
+static int host_setvbuf_operation(void *opaque)
+{
+    struct host_context *context = opaque;
+    return setvbuf(context->stream, NULL, _IOFBF, BUFSIZ);
+}
+
+static int iris_setvbuf_operation(void *opaque)
+{
+    struct iris_context *context = opaque;
+    return iris_setvbuf(context->stream, NULL, _IOFBF, BUFSIZ);
 }
 
 static int host_vprintf_call(const char *format, ...)
@@ -647,11 +820,14 @@ int main(void)
     iris_FILE *iris_position = iris_fopen("/dev/zero", "r");
     FILE *host_rewind_stream = fopen("/dev/zero", "r");
     iris_FILE *iris_rewind_stream = iris_fopen("/dev/zero", "r");
+    FILE *host_reopen_stream = fopen("/dev/null", "w");
+    iris_FILE *iris_reopen_stream = iris_fopen("/dev/null", "w");
     if (host_format_stream == NULL || iris_format_stream == NULL ||
         host_input == NULL || iris_input == NULL || host_output == NULL ||
         iris_output == NULL || host_eof == NULL || iris_eof == NULL ||
         host_position == NULL || iris_position == NULL ||
-        host_rewind_stream == NULL || iris_rewind_stream == NULL) {
+        host_rewind_stream == NULL || iris_rewind_stream == NULL ||
+        host_reopen_stream == NULL || iris_reopen_stream == NULL) {
         perror("open stdio benchmark streams");
         return 1;
     }
@@ -668,6 +844,8 @@ int main(void)
     struct iris_context iris_position_context = { .stream = iris_position };
     struct host_context host_rewind_context = { .stream = host_rewind_stream };
     struct iris_context iris_rewind_context = { .stream = iris_rewind_stream };
+    struct host_context host_reopen_context = { .stream = host_reopen_stream };
+    struct iris_context iris_reopen_context = { .stream = iris_reopen_stream };
     memset(host_writer.data, 'x', sizeof(host_writer.data));
     memset(iris_writer.data, 'x', sizeof(iris_writer.data));
     memcpy(host_writer.text, "benchmark", 10);
@@ -677,7 +855,7 @@ int main(void)
     fgetc(host_position);
     iris_fgetc(iris_position);
 
-    printf("All declared stdio.h functions vs %s; median of %d trials\n",
+    printf("Selected stdio.h functions vs %s; median of %d trials\n",
         BENCH_LIBC_NAME, TRIALS);
     puts("+------------------+------------------+------------------+------------------+");
     printf("| %-16s | %-16s | %-16s | %-16s |\n",
@@ -687,6 +865,10 @@ int main(void)
         iris_snprintf_call, &iris_format, NULL);
     report("vsnprintf", FORMAT_ITERATIONS, host_vsnprintf_operation, &host_format,
         NULL, iris_vsnprintf_operation, &iris_format, NULL);
+    report("sprintf", FORMAT_ITERATIONS, host_sprintf_call, &host_format, NULL,
+        iris_sprintf_call, &iris_format, NULL);
+    report("vsprintf", FORMAT_ITERATIONS, host_vsprintf_operation, &host_format,
+        NULL, iris_vsprintf_operation, &iris_format, NULL);
     report("fprintf", FORMAT_ITERATIONS, host_fprintf, &host_format_output,
         (stdio_operation)host_fflush_operation, iris_fprintf_call, &iris_format_output,
         (stdio_operation)iris_fflush_operation);
@@ -700,6 +882,10 @@ int main(void)
         (stdio_operation)iris_fflush_operation);
     report("fgetc", STREAM_ITERATIONS, host_fgetc_operation, &host_reader, NULL,
         iris_fgetc_operation, &iris_reader, NULL);
+    report("getc", STREAM_ITERATIONS, host_getc_operation, &host_reader, NULL,
+        iris_getc_operation, &iris_reader, NULL);
+    report("ungetc/getc", STREAM_ITERATIONS, host_ungetc_operation, &host_reader,
+        NULL, iris_ungetc_operation, &iris_reader, NULL);
     report("fputc", STREAM_ITERATIONS, host_fputc_operation, &host_writer,
         (stdio_operation)host_fflush_operation, iris_fputc_operation, &iris_writer,
         (stdio_operation)iris_fflush_operation);
@@ -724,6 +910,17 @@ int main(void)
         NULL, iris_rewind_operation, &iris_rewind_context, NULL);
     report("fopen+close", STREAM_ITERATIONS, host_open_close_operation,
         NULL, NULL, iris_open_close_operation, NULL, NULL);
+    report("tmpfile+close", CLOSE_ITERATIONS, host_tmpfile_operation,
+        NULL, NULL, iris_tmpfile_operation, NULL, NULL);
+    report("tmpnam", CLOSE_ITERATIONS, host_tmpnam_operation, &host_format,
+        NULL, iris_tmpnam_operation, &iris_format, NULL);
+    report("remove+setup", CLOSE_ITERATIONS, host_remove_operation, &host_format,
+        NULL, iris_remove_operation, &iris_format, NULL);
+    report("freopen", CLOSE_ITERATIONS, host_freopen_operation,
+        &host_reopen_context, NULL, iris_freopen_operation,
+        &iris_reopen_context, NULL);
+    report("setvbuf", STREAM_ITERATIONS, host_setvbuf_operation, &host_output,
+        NULL, iris_setvbuf_operation, &iris_writer, NULL);
     report_fclose();
     puts("+------------------+------------------+------------------+------------------+");
 
@@ -739,6 +936,8 @@ int main(void)
     iris_fclose(iris_position);
     fclose(host_rewind_stream);
     iris_fclose(iris_rewind_stream);
+    fclose(host_reopen_context.stream);
+    iris_fclose(iris_reopen_context.stream);
     fprintf(stderr, "stdio benchmark checksum: %zu\n", benchmark_sink);
     return 0;
 }

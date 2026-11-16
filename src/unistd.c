@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -14,6 +15,8 @@
 #define IRIS_SYS_READ 0
 #define IRIS_SYS_WRITE 1
 #define IRIS_SYS_CLOSE 3
+#define IRIS_SYS_RENAMEAT 264
+#define IRIS_SYS_UNLINKAT 263
 #define IRIS_SYS_LSEEK 8
 #define IRIS_SYS_GETPID 39
 #define IRIS_SYS_IOCTL 16
@@ -82,6 +85,8 @@ static long linux_syscall4(long number, long first, long second, long third, lon
 #define IRIS_SYS_READ 63
 #define IRIS_SYS_WRITE 64
 #define IRIS_SYS_CLOSE 57
+#define IRIS_SYS_RENAMEAT 38
+#define IRIS_SYS_UNLINKAT 35
 #define IRIS_SYS_LSEEK 62
 #define IRIS_SYS_EXIT_GROUP 94
 #define IRIS_SYS_GETPID 172
@@ -378,6 +383,58 @@ ssize_t write(int file_descriptor, const void *buffer, size_t count)
 int close(int file_descriptor)
 {
     return (int)syscall_result(linux_syscall1(IRIS_SYS_CLOSE, file_descriptor));
+}
+
+int unlink(const char *path)
+{
+    return (int)syscall_result(linux_syscall3(IRIS_SYS_UNLINKAT,
+        -100, (long)path, 0));
+}
+
+int rmdir(const char *path)
+{
+    return (int)syscall_result(linux_syscall3(IRIS_SYS_UNLINKAT,
+        -100, (long)path, 0x200));
+}
+
+int rename(const char *old_path, const char *new_path)
+{
+    return (int)syscall_result(linux_syscall4(IRIS_SYS_RENAMEAT,
+        -100, (long)old_path, -100, (long)new_path));
+}
+
+int mkstemp(char *template_path)
+{
+    static uint32_t sequence;
+    static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    size_t length;
+
+    if (template_path == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    length = strlen(template_path);
+    if (length < 6 || memcmp(template_path + length - 6, "XXXXXX", 6) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (unsigned int attempt = 0; attempt < 128; attempt++) {
+        uint32_t value = ++sequence ^ (uint32_t)getpid() ^
+            (uint32_t)(attempt * 0x9e3779b9U);
+        for (size_t index = 0; index < 6; index++) {
+            value ^= value << 13;
+            value ^= value >> 17;
+            value ^= value << 5;
+            template_path[length - 6 + index] = alphabet[value % 36U];
+        }
+        int descriptor = open(template_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (descriptor >= 0 || errno != EEXIST) {
+            return descriptor;
+        }
+    }
+    errno = EEXIST;
+    return -1;
 }
 
 int open(const char *path, int flags, ...)

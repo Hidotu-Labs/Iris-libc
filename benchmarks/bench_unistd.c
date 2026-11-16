@@ -13,16 +13,24 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
 #define IO_ITERATIONS 2000U
 #define TIME_ITERATIONS 1000000U
+#define CLOCK_ITERATIONS 100000U
+#define CALENDAR_ITERATIONS 100000U
 #define CLOSE_ITERATIONS 128U
+#define FILE_ITERATIONS 128U
 
 extern ssize_t iris_read(int file_descriptor, void *buffer, size_t count);
 extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
 extern int iris_close(int file_descriptor);
+extern int iris_unlink(const char *path);
+extern int iris_rmdir(const char *path);
+extern int iris_mkstemp(char *template_path);
+extern int iris_rename(const char *old_path, const char *new_path);
 extern int iris_open(const char *path, int flags, ...);
 extern off_t iris_lseek(int file_descriptor, off_t offset, int whence);
 extern int iris_ftruncate(int file_descriptor, off_t length);
@@ -51,6 +59,17 @@ extern int iris_tcgetattr(int file_descriptor, struct iris_termios *settings);
 extern int iris_tcsetattr(int file_descriptor, int action,
     const struct iris_termios *settings);
 extern int iris_isatty(int file_descriptor);
+extern clock_t iris_clock(void);
+extern double iris_difftime(time_t end, time_t beginning);
+extern struct tm *iris_gmtime(const time_t *timer);
+extern struct tm *iris_localtime(const time_t *timer);
+extern struct tm *iris_gmtime_r(const time_t *restrict timer,
+    struct tm *restrict result);
+extern struct tm *iris_localtime_r(const time_t *restrict timer,
+    struct tm *restrict result);
+extern time_t iris_mktime(struct tm *time_value);
+extern size_t iris_strftime(char *restrict buffer, size_t capacity,
+    const char *restrict format, const struct tm *restrict time_value);
 
 typedef ssize_t (*read_function)(int, void *, size_t);
 typedef ssize_t (*write_function)(int, const void *, size_t);
@@ -488,6 +507,347 @@ static double time_iris_time_syscall(size_t iterations)
     return time_time(iterations, __iris_time_syscall);
 }
 
+static double time_clock(size_t iterations, clock_t (*function)(void))
+{
+    struct timespec start;
+    struct timespec end;
+    clock_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function();
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_clock(size_t iterations)
+{
+    return time_clock(iterations, clock);
+}
+
+static double time_iris_clock(size_t iterations)
+{
+    return time_clock(iterations, iris_clock);
+}
+
+static double time_difftime(size_t iterations,
+    double (*function)(time_t, time_t))
+{
+    struct timespec start;
+    struct timespec end;
+    double result = 0.0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function((time_t)1709164800 + (time_t)index, 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_difftime(size_t iterations)
+{
+    return time_difftime(iterations, difftime);
+}
+
+static double time_iris_difftime(size_t iterations)
+{
+    return time_difftime(iterations, iris_difftime);
+}
+
+static double time_broken_time(size_t iterations,
+    struct tm *(*function)(const time_t *))
+{
+    struct timespec start;
+    struct timespec end;
+    const time_t timestamp = 1709164800;
+    struct tm *result = NULL;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(&timestamp);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (size_t)(result->tm_yday + 1) : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_gmtime(size_t iterations)
+{
+    return time_broken_time(iterations, gmtime);
+}
+
+static double time_iris_gmtime(size_t iterations)
+{
+    return time_broken_time(iterations, iris_gmtime);
+}
+
+static double time_host_localtime(size_t iterations)
+{
+    return time_broken_time(iterations, localtime);
+}
+
+static double time_iris_localtime(size_t iterations)
+{
+    return time_broken_time(iterations, iris_localtime);
+}
+
+static double time_reentrant_time(size_t iterations,
+    struct tm *(*function)(const time_t *restrict, struct tm *restrict))
+{
+    struct timespec start;
+    struct timespec end;
+    const time_t timestamp = 1709164800;
+    struct tm result;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        function(&timestamp, &result);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(result.tm_yday + 1);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_gmtime_r(size_t iterations)
+{
+    return time_reentrant_time(iterations, gmtime_r);
+}
+
+static double time_iris_gmtime_r(size_t iterations)
+{
+    return time_reentrant_time(iterations, iris_gmtime_r);
+}
+
+static double time_host_localtime_r(size_t iterations)
+{
+    return time_reentrant_time(iterations, localtime_r);
+}
+
+static double time_iris_localtime_r(size_t iterations)
+{
+    return time_reentrant_time(iterations, iris_localtime_r);
+}
+
+static double time_mktime(size_t iterations, time_t (*function)(struct tm *))
+{
+    struct timespec start;
+    struct timespec end;
+    struct tm value = {
+        .tm_sec = 56, .tm_min = 34, .tm_hour = 12,
+        .tm_mday = 29, .tm_mon = 1, .tm_year = 124
+    };
+    time_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function(&value);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_mktime(size_t iterations)
+{
+    return time_mktime(iterations, mktime);
+}
+
+static double time_iris_mktime(size_t iterations)
+{
+    return time_mktime(iterations, iris_mktime);
+}
+
+static double time_strftime(size_t iterations,
+    size_t (*function)(char *restrict, size_t, const char *restrict,
+        const struct tm *restrict))
+{
+    struct timespec start;
+    struct timespec end;
+    const struct tm value = {
+        .tm_sec = 56, .tm_min = 34, .tm_hour = 12,
+        .tm_mday = 29, .tm_mon = 1, .tm_year = 124,
+        .tm_wday = 4, .tm_yday = 59, .tm_isdst = 0
+    };
+    char buffer[64];
+    size_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &value);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result + (unsigned char)buffer[0];
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_strftime(size_t iterations)
+{
+    return time_strftime(iterations, strftime);
+}
+
+static double time_iris_strftime(size_t iterations)
+{
+    return time_strftime(iterations, iris_strftime);
+}
+
+static double time_mkstemp(size_t iterations, int (*function)(char *))
+{
+    struct timespec start;
+    struct timespec end;
+    char paths[FILE_ITERATIONS][64];
+    int descriptors[FILE_ITERATIONS];
+
+    if (iterations > FILE_ITERATIONS) {
+        iterations = FILE_ITERATIONS;
+    }
+    for (size_t index = 0; index < iterations; index++) {
+        snprintf(paths[index], sizeof(paths[index]),
+            "/tmp/iris-mkstemp-bench-%ld-%zu-XXXXXX", (long)getpid(), index);
+        descriptors[index] = -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        descriptors[index] = function(paths[index]);
+        benchmark_sink += (size_t)(descriptors[index] >= 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    for (size_t index = 0; index < iterations; index++) {
+        if (descriptors[index] >= 0) {
+            close(descriptors[index]);
+            unlink(paths[index]);
+        }
+    }
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_mkstemp(size_t iterations)
+{
+    return time_mkstemp(iterations, mkstemp);
+}
+
+static double time_iris_mkstemp(size_t iterations)
+{
+    return time_mkstemp(iterations, iris_mkstemp);
+}
+
+static double time_unlink(size_t iterations, int (*function)(const char *))
+{
+    struct timespec start;
+    struct timespec end;
+    char paths[FILE_ITERATIONS][64];
+    size_t prepared = 0;
+
+    if (iterations > FILE_ITERATIONS) {
+        iterations = FILE_ITERATIONS;
+    }
+    for (; prepared < iterations; prepared++) {
+        snprintf(paths[prepared], sizeof(paths[prepared]),
+            "/tmp/iris-unlink-bench-%ld-%zu-XXXXXX", (long)getpid(), prepared);
+        int descriptor = mkstemp(paths[prepared]);
+        if (descriptor < 0 || close(descriptor) != 0) {
+            if (descriptor >= 0) close(descriptor);
+            break;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < prepared; index++) {
+        benchmark_sink += (size_t)(function(paths[index]) == 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    for (size_t index = 0; index < prepared; index++) {
+        unlink(paths[index]);
+    }
+    return prepared == 0 ? 0.0 :
+        elapsed_nanoseconds(start, end) / (double)prepared;
+}
+
+static double time_host_unlink(size_t iterations)
+{
+    return time_unlink(iterations, unlink);
+}
+
+static double time_iris_unlink(size_t iterations)
+{
+    return time_unlink(iterations, iris_unlink);
+}
+
+static double time_rmdir(size_t iterations, int (*function)(const char *))
+{
+    struct timespec start;
+    struct timespec end;
+    char paths[FILE_ITERATIONS][64];
+    size_t prepared = 0;
+
+    if (iterations > FILE_ITERATIONS) {
+        iterations = FILE_ITERATIONS;
+    }
+    for (; prepared < iterations; prepared++) {
+        snprintf(paths[prepared], sizeof(paths[prepared]),
+            "/tmp/iris-rmdir-bench-%ld-%zu", (long)getpid(), prepared);
+        if (mkdir(paths[prepared], 0700) != 0) {
+            break;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < prepared; index++) {
+        benchmark_sink += (size_t)(function(paths[index]) == 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    for (size_t index = 0; index < prepared; index++) {
+        rmdir(paths[index]);
+    }
+    return prepared == 0 ? 0.0 :
+        elapsed_nanoseconds(start, end) / (double)prepared;
+}
+
+static double time_host_rmdir(size_t iterations)
+{
+    return time_rmdir(iterations, rmdir);
+}
+
+static double time_iris_rmdir(size_t iterations)
+{
+    return time_rmdir(iterations, iris_rmdir);
+}
+
+static double time_rename(size_t iterations, int (*function)(const char *, const char *))
+{
+    struct timespec start;
+    struct timespec end;
+    char source[] = "/tmp/iris-rename-bench-XXXXXX";
+    char destination[sizeof(source) + 8];
+    int descriptor = mkstemp(source);
+    if (descriptor < 0) {
+        return 0.0;
+    }
+    close(descriptor);
+    snprintf(destination, sizeof(destination), "%s.moved", source);
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        benchmark_sink += (size_t)(function(source, destination) == 0);
+        benchmark_sink += (size_t)(function(destination, source) == 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    unlink(source);
+    unlink(destination);
+    return elapsed_nanoseconds(start, end) / (double)(iterations * 2U);
+}
+
+static double time_host_rename(size_t iterations)
+{
+    return time_rename(iterations, rename);
+}
+
+static double time_iris_rename(size_t iterations)
+{
+    return time_rename(iterations, iris_rename);
+}
+
 static double time_host_signal(size_t iterations)
 {
     return time_signal(iterations, signal);
@@ -634,6 +994,7 @@ int main(void)
 
     printf("Linux syscalls vs %s; median of %d trials\n",
         BENCH_LIBC_NAME, TRIALS);
+    puts("Calendar caveat: Iris clock is monotonic; Iris localtime/mktime use UTC.");
     if (__iris_init_vdso((uintptr_t)getauxval(AT_SYSINFO_EHDR)) != 0) {
         fprintf(stderr, "VDSO time unavailable; Iris time() will use syscall fallback\n");
     }
@@ -661,6 +1022,14 @@ int main(void)
         (io_benchmark_function){ .getpid = iris_getpid }, 0);
     report_simple("open+close", IO_ITERATIONS,
         time_host_open_close, time_iris_open_close);
+    report_simple("mkstemp", FILE_ITERATIONS,
+        time_host_mkstemp, time_iris_mkstemp);
+    report_simple("unlink", FILE_ITERATIONS,
+        time_host_unlink, time_iris_unlink);
+    report_simple("rmdir", FILE_ITERATIONS,
+        time_host_rmdir, time_iris_rmdir);
+    report_simple("rename", FILE_ITERATIONS,
+        time_host_rename, time_iris_rename);
     report_simple("lseek", IO_ITERATIONS, time_host_lseek, time_iris_lseek);
     report_simple("ftruncate", IO_ITERATIONS,
         time_host_ftruncate, time_iris_ftruncate);
@@ -672,6 +1041,22 @@ int main(void)
         time_host_time_symbol, time_iris_time_symbol);
     report_simple("time-syscall", TIME_ITERATIONS,
         time_host_time_syscall, time_iris_time_syscall);
+    report_simple("clock", CLOCK_ITERATIONS,
+        time_host_clock, time_iris_clock);
+    report_simple("difftime", TIME_ITERATIONS,
+        time_host_difftime, time_iris_difftime);
+    report_simple("gmtime", CALENDAR_ITERATIONS,
+        time_host_gmtime, time_iris_gmtime);
+    report_simple("localtime", CALENDAR_ITERATIONS,
+        time_host_localtime, time_iris_localtime);
+    report_simple("gmtime_r", CALENDAR_ITERATIONS,
+        time_host_gmtime_r, time_iris_gmtime_r);
+    report_simple("localtime_r", CALENDAR_ITERATIONS,
+        time_host_localtime_r, time_iris_localtime_r);
+    report_simple("mktime", CALENDAR_ITERATIONS,
+        time_host_mktime, time_iris_mktime);
+    report_simple("strftime", CALENDAR_ITERATIONS,
+        time_host_strftime, time_iris_strftime);
     report_simple("signal", IO_ITERATIONS, time_host_signal, time_iris_signal);
     report_simple("isatty", IO_ITERATIONS, time_host_isatty, time_iris_isatty);
     report_simple("tcgetattr", IO_ITERATIONS,

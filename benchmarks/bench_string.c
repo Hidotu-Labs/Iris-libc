@@ -21,7 +21,19 @@ extern int iris_memcmp(const void *left, const void *right, size_t count);
 extern size_t iris_strlen(const char *string);
 extern int iris_strcmp(const char *left, const char *right);
 extern int iris_strncmp(const char *left, const char *right, size_t count);
+extern void *iris_memchr(const void *memory, int character, size_t count);
+extern char *iris_strcpy(char *restrict destination, const char *restrict source);
+extern char *iris_strncpy(char *restrict destination, const char *restrict source,
+    size_t count);
+extern char *iris_strcat(char *restrict destination, const char *restrict source);
+extern char *iris_strncat(char *restrict destination, const char *restrict source,
+    size_t count);
+extern int iris_strcoll(const char *left, const char *right);
 extern char *iris_strchr(const char *string, int character);
+extern char *iris_strrchr(const char *string, int character);
+extern char *iris_strpbrk(const char *string, const char *accept);
+extern size_t iris_strspn(const char *string, const char *accept);
+extern size_t iris_strcspn(const char *string, const char *reject);
 extern char *iris_strstr(const char *string, const char *substring);
 extern char *iris_strerror(int error_number);
 extern ssize_t iris_write(int file_descriptor, const void *buffer, size_t count);
@@ -38,11 +50,17 @@ typedef void *(*copy_function)(void *, const void *, size_t);
 typedef void *(*move_function)(void *, const void *, size_t);
 typedef void *(*set_function)(void *, int, size_t);
 typedef int (*memory_compare_function)(const void *, const void *, size_t);
+typedef void *(*memory_search_function)(const void *, int, size_t);
 typedef size_t (*length_function)(const char *);
 typedef int (*string_compare_function)(const char *, const char *);
 typedef int (*string_ncompare_function)(const char *, const char *, size_t);
+typedef char *(*string_copy_function)(char *, const char *);
+typedef char *(*string_ncopy_function)(char *, const char *, size_t);
+typedef char *(*string_concat_function)(char *, const char *);
+typedef char *(*string_nconcat_function)(char *, const char *, size_t);
 typedef char *(*character_search_function)(const char *, int);
 typedef char *(*substring_search_function)(const char *, const char *);
+typedef size_t (*string_span_function)(const char *, const char *);
 typedef char *(*error_text_function)(int);
 typedef ssize_t (*write_function)(int, const void *, size_t);
 typedef int (*snprintf_function)(char *, size_t, const char *, ...);
@@ -51,11 +69,17 @@ typedef union {
     move_function move;
     set_function set;
     memory_compare_function memory_compare;
+    memory_search_function memory_search;
     length_function length;
     string_compare_function string_compare;
     string_ncompare_function string_ncompare;
+    string_copy_function string_copy;
+    string_ncopy_function string_ncopy;
+    string_concat_function string_concat;
+    string_nconcat_function string_nconcat;
     character_search_function character_search;
     substring_search_function substring_search;
+    string_span_function string_span;
     error_text_function error_text;
     snprintf_function format;
 } benchmark_function;
@@ -66,11 +90,13 @@ typedef union {
 static unsigned char source_data[MAX_SIZE];
 static unsigned char destination_data[MAX_SIZE + 1];
 static unsigned char compare_data[MAX_SIZE];
+static unsigned char memory_search_data[MAX_SIZE];
 static char left_text[MAX_SIZE + 1];
 static char right_text[MAX_SIZE + 1];
 static volatile size_t benchmark_sink;
 static char format_buffer[256];
 static char format_text[128];
+static char string_destinations[FORMATTED_IO_ITERATIONS][64];
 
 static size_t iterations_for(size_t size)
 {
@@ -161,6 +187,28 @@ static double time_memory_compare(size_t size, size_t iterations, benchmark_func
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
+static double time_memory_search(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    memory_search_function function = opaque_function.memory_search;
+    struct timespec start;
+    struct timespec end;
+    void *result = NULL;
+
+    memset(memory_search_data, 'a', size);
+    if (size != 0) {
+        memory_search_data[size - 1] = 'z';
+    }
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(memory_search_data, 'z', size);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL
+        ? (size_t)((unsigned char *)result - memory_search_data) + 1U : 0U;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
 static double time_length(size_t size, size_t iterations, benchmark_function opaque_function)
 {
     length_function function = opaque_function.length;
@@ -215,6 +263,89 @@ static double time_string_ncompare(size_t size, size_t iterations, benchmark_fun
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
+static double time_string_copy(size_t size, size_t iterations,
+    benchmark_function opaque_function, int bounded)
+{
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+    const char *source = "Iris libc benchmark string";
+
+    if (bounded) {
+        string_ncopy_function function = opaque_function.string_ncopy;
+        size_t count = size < 32 ? size : 32;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (size_t index = 0; index < iterations; index++) {
+            result = function(string_destinations[index], source, count);
+        }
+    } else {
+        string_copy_function function = opaque_function.string_copy;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (size_t index = 0; index < iterations; index++) {
+            result = function(string_destinations[index], source);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (unsigned char)result[0] : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_strcpy(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    return time_string_copy(size, iterations, opaque_function, 0);
+}
+
+static double time_strncpy(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    return time_string_copy(size, iterations, opaque_function, 1);
+}
+
+static double time_string_concat(size_t iterations,
+    benchmark_function opaque_function, int bounded)
+{
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+    static const char prefix[] = "iris";
+    static const char suffix[] = "-libc";
+
+    for (size_t index = 0; index < iterations; index++) {
+        memcpy(string_destinations[index], prefix, sizeof(prefix));
+    }
+    if (bounded) {
+        string_nconcat_function function = opaque_function.string_nconcat;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (size_t index = 0; index < iterations; index++) {
+            result = function(string_destinations[index], suffix, 3);
+        }
+    } else {
+        string_concat_function function = opaque_function.string_concat;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (size_t index = 0; index < iterations; index++) {
+            result = function(string_destinations[index], suffix);
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (unsigned char)result[0] : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_strcat(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    (void)size;
+    return time_string_concat(iterations, opaque_function, 0);
+}
+
+static double time_strncat(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    (void)size;
+    return time_string_concat(iterations, opaque_function, 1);
+}
+
 static double time_character_search(size_t size, size_t iterations,
     benchmark_function opaque_function)
 {
@@ -251,6 +382,46 @@ static double time_substring_search(size_t size, size_t iterations,
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     benchmark_sink += result != NULL ? (size_t)(result - text) : 0;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_string_span(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    string_span_function function = opaque_function.string_span;
+    static const char text[] = "Iris libc Kilo compatibility benchmark";
+    static const char set[] = "Iris cblK";
+    struct timespec start;
+    struct timespec end;
+    size_t result = 0;
+
+    (void)size;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(text, set);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_string_prefix_search(size_t size, size_t iterations,
+    benchmark_function opaque_function)
+{
+    substring_search_function function = opaque_function.substring_search;
+    static const char text[] = "Iris libc Kilo compatibility benchmark";
+    static const char accept[] = "xyzK";
+    struct timespec start;
+    struct timespec end;
+    char *result = NULL;
+
+    (void)size;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result = function(text, accept);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result != NULL ? (size_t)(result - text) + 1U : 0U;
     return elapsed_nanoseconds(start, end) / (double)iterations;
 }
 
@@ -435,6 +606,7 @@ int main(void)
     for (size_t index = 0; index < MAX_SIZE; index++) {
         source_data[index] = (unsigned char)(index * 31U + 7U);
         compare_data[index] = source_data[index];
+        memory_search_data[index] = 'a';
         left_text[index] = (char)('a' + index % 26U);
         right_text[index] = left_text[index];
     }
@@ -476,12 +648,32 @@ int main(void)
         REPORT(strlen, size, iterations, time_length, length, strlen, iris_strlen);
         REPORT(strcmp, size, iterations, time_string_compare, string_compare, strcmp, iris_strcmp);
         REPORT(strncmp, size, iterations, time_string_ncompare, string_ncompare, strncmp, iris_strncmp);
+            REPORT(memchr, size, iterations, time_memory_search, memory_search,
+                memchr, iris_memchr);
     }
 
     REPORT(strchr, 0, FORMATTED_IO_ITERATIONS, time_character_search,
         character_search, strchr, iris_strchr);
+    REPORT(strrchr, 0, FORMATTED_IO_ITERATIONS, time_character_search,
+        character_search, strrchr, iris_strrchr);
     REPORT(strstr, 0, FORMATTED_IO_ITERATIONS, time_substring_search,
         substring_search, strstr, iris_strstr);
+    REPORT(strpbrk, 0, FORMATTED_IO_ITERATIONS, time_string_prefix_search,
+        substring_search, strpbrk, iris_strpbrk);
+    REPORT(strspn, 0, FORMATTED_IO_ITERATIONS, time_string_span,
+        string_span, strspn, iris_strspn);
+    REPORT(strcspn, 0, FORMATTED_IO_ITERATIONS, time_string_span,
+        string_span, strcspn, iris_strcspn);
+    REPORT(strcoll, 32, FORMATTED_IO_ITERATIONS, time_string_compare,
+        string_compare, strcoll, iris_strcoll);
+    REPORT(strcpy, 0, FORMATTED_IO_ITERATIONS, time_strcpy,
+        string_copy, strcpy, iris_strcpy);
+    REPORT(strncpy, 32, FORMATTED_IO_ITERATIONS, time_strncpy,
+        string_ncopy, strncpy, iris_strncpy);
+    REPORT(strcat, 0, FORMATTED_IO_ITERATIONS, time_strcat,
+        string_concat, strcat, iris_strcat);
+    REPORT(strncat, 3, FORMATTED_IO_ITERATIONS, time_strncat,
+        string_nconcat, strncat, iris_strncat);
     REPORT(strerror, 0, FORMATTED_IO_ITERATIONS, time_error_text,
         error_text, strerror, iris_strerror);
 

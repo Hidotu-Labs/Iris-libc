@@ -495,6 +495,30 @@ static void *copy_avx2(unsigned char *output, const unsigned char *input, size_t
     return output;
 }
 
+/* 129..256 bytes: overlapping 32-byte loads, then stores; the source is read before writing. */
+__attribute__((target("avx2")))
+static void *copy_medium_avx2(unsigned char *output, const unsigned char *input, size_t count)
+{
+    __m256i first = _mm256_loadu_si256((const __m256i *)input);
+    __m256i second = _mm256_loadu_si256((const __m256i *)(input + 32));
+    __m256i third = _mm256_loadu_si256((const __m256i *)(input + 64));
+    __m256i fourth = _mm256_loadu_si256((const __m256i *)(input + 96));
+    __m256i fifth = _mm256_loadu_si256((const __m256i *)(input + count - 128));
+    __m256i sixth = _mm256_loadu_si256((const __m256i *)(input + count - 96));
+    __m256i seventh = _mm256_loadu_si256((const __m256i *)(input + count - 64));
+    __m256i eighth = _mm256_loadu_si256((const __m256i *)(input + count - 32));
+
+    _mm256_storeu_si256((__m256i *)output, first);
+    _mm256_storeu_si256((__m256i *)(output + 32), second);
+    _mm256_storeu_si256((__m256i *)(output + 64), third);
+    _mm256_storeu_si256((__m256i *)(output + 96), fourth);
+    _mm256_storeu_si256((__m256i *)(output + count - 128), fifth);
+    _mm256_storeu_si256((__m256i *)(output + count - 96), sixth);
+    _mm256_storeu_si256((__m256i *)(output + count - 64), seventh);
+    _mm256_storeu_si256((__m256i *)(output + count - 32), eighth);
+    return output;
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static void *copy_avx512(unsigned char *output, const unsigned char *input, size_t count)
 {
@@ -700,6 +724,27 @@ static void *move_avx512(unsigned char *output, const unsigned char *input, size
 }
 
 /* 65..256 bytes as straight-line code; kept separate so memset reaches it with few branches. */
+/* 65..256 bytes: overlapping 32-byte stores from both ends. */
+__attribute__((target("avx2")))
+static void *set_medium_avx2(void *destination, int value, size_t count)
+{
+    unsigned char *output = destination;
+    __m256i pattern = _mm256_set1_epi8((char)value);
+
+    _mm256_storeu_si256((__m256i *)output, pattern);
+    _mm256_storeu_si256((__m256i *)(output + 32), pattern);
+    _mm256_storeu_si256((__m256i *)(output + count - 64), pattern);
+    _mm256_storeu_si256((__m256i *)(output + count - 32), pattern);
+    if (count > 128) {
+        _mm256_storeu_si256((__m256i *)(output + 64), pattern);
+        _mm256_storeu_si256((__m256i *)(output + 96), pattern);
+        _mm256_storeu_si256((__m256i *)(output + count - 128), pattern);
+        _mm256_storeu_si256((__m256i *)(output + count - 96), pattern);
+    }
+    _mm256_zeroupper();
+    return destination;
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl")))
 static void *set_medium_avx512(void *destination, int value, size_t count)
 {
@@ -1418,6 +1463,12 @@ void *memcpy(void *restrict destination, const void *restrict source, size_t cou
     unsigned char *output = destination;
     const unsigned char *input = source;
 
+#if defined(IRIS_HAVE_AVX2)
+    /* Tail call: the 129..256 case needs no frame of its own here. */
+    if (count > 128 && count <= 256 && cpu_has_avx2()) {
+        return copy_medium_avx2(output, input, count);
+    }
+#endif
     if (count <= 64) {
         if (count == 16) {
             __m128i value = _mm_loadu_si128((const __m128i *)input);
@@ -1492,6 +1543,10 @@ void *memset(void *destination, int value, size_t count)
         return destination;
     }
 #if defined(IRIS_HAVE_AVX2)
+    /* Tail call: the 129..256 case needs no frame of its own here. */
+    if (count <= 256 && cpu_has_avx2()) {
+        return set_medium_avx2(destination, value, count);
+    }
     if (__builtin_expect(count <= 256, 1) && __builtin_expect(cpu_avx512_known(), 1)) {
         return set_medium_avx512(destination, value, count);
     }
@@ -1542,6 +1597,213 @@ int memcmp(const void *left, const void *right, size_t count)
         return memcmp_sse2(left, right, count);
     }
     return compare_bytes(left, right, count);
+}
+
+static void *memchr_sse2(const unsigned char *bytes, unsigned char target, size_t count)
+{
+    const __m128i target_vector = _mm_set1_epi8((char)target);
+
+    /* Test 64 bytes per step; locate the exact byte only on a hit. */
+    while (count >= 64) {
+        __m128i first = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)bytes), target_vector);
+        __m128i second = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(bytes + 16)),
+            target_vector);
+        __m128i third = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(bytes + 32)),
+            target_vector);
+        __m128i fourth = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)(bytes + 48)),
+            target_vector);
+        __m128i any = _mm_or_si128(_mm_or_si128(first, second), _mm_or_si128(third, fourth));
+
+        if (_mm_movemask_epi8(any) != 0) {
+            uint64_t mask = (uint64_t)(unsigned int)_mm_movemask_epi8(first) |
+                ((uint64_t)(unsigned int)_mm_movemask_epi8(second) << 16) |
+                ((uint64_t)(unsigned int)_mm_movemask_epi8(third) << 32) |
+                ((uint64_t)(unsigned int)_mm_movemask_epi8(fourth) << 48);
+
+            return (void *)(bytes + __builtin_ctzll(mask));
+        }
+        bytes += 64;
+        count -= 64;
+    }
+    while (count >= 16) {
+        __m128i chunk = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)bytes), target_vector);
+        unsigned int mask = (unsigned int)_mm_movemask_epi8(chunk);
+
+        if (mask != 0) {
+            return (void *)(bytes + __builtin_ctz(mask));
+        }
+        bytes += 16;
+        count -= 16;
+    }
+    for (size_t index = 0; index < count; index++) {
+        if (bytes[index] == target) {
+            return (void *)(bytes + index);
+        }
+    }
+    return NULL;
+}
+
+#if defined(IRIS_HAVE_AVX2)
+__attribute__((target("avx2")))
+static void *memchr_avx2(const unsigned char *bytes, unsigned char target, size_t count)
+{
+    const __m256i target_vector = _mm256_set1_epi8((char)target);
+
+    while (count >= 128) {
+        __m256i first = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)bytes),
+            target_vector);
+        __m256i second = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(bytes + 32)),
+            target_vector);
+        __m256i third = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(bytes + 64)),
+            target_vector);
+        __m256i fourth = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)(bytes + 96)),
+            target_vector);
+        __m256i any = _mm256_or_si256(_mm256_or_si256(first, second),
+            _mm256_or_si256(third, fourth));
+
+        if (!_mm256_testz_si256(any, any)) {
+            unsigned int mask = (unsigned int)_mm256_movemask_epi8(first);
+            if (mask != 0) {
+                return (void *)(bytes + __builtin_ctz(mask));
+            }
+            mask = (unsigned int)_mm256_movemask_epi8(second);
+            if (mask != 0) {
+                return (void *)(bytes + 32 + __builtin_ctz(mask));
+            }
+            mask = (unsigned int)_mm256_movemask_epi8(third);
+            if (mask != 0) {
+                return (void *)(bytes + 64 + __builtin_ctz(mask));
+            }
+            return (void *)(bytes + 96 + __builtin_ctz(
+                (unsigned int)_mm256_movemask_epi8(fourth)));
+        }
+        bytes += 128;
+        count -= 128;
+    }
+    while (count >= 32) {
+        __m256i chunk = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)bytes),
+            target_vector);
+        unsigned int mask = (unsigned int)_mm256_movemask_epi8(chunk);
+
+        if (mask != 0) {
+            return (void *)(bytes + __builtin_ctz(mask));
+        }
+        bytes += 32;
+        count -= 32;
+    }
+    return memchr_sse2(bytes, target, count);
+}
+#endif
+
+__attribute__((aligned(64)))
+/* Aligned-block search; used when the string's own blocks would cross a page. */
+static char *strrchr_aligned(const char *string, unsigned char target)
+{
+    const __m128i target_vector = _mm_set1_epi8((char)target);
+    const __m128i zero_vector = _mm_setzero_si128();
+    const char *first = (const char *)((uintptr_t)string & ~(uintptr_t)15U);
+    /* Bytes before the start of the string share the first aligned chunk. */
+    unsigned int first_valid = 0xffffU << ((uintptr_t)string & 15U);
+    const char *chunk = first;
+    unsigned int valid = first_valid;
+    unsigned int terminators;
+
+    /* Find the terminator first; the last match is then searched backwards from it. */
+    for (;;) {
+        terminators = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_load_si128((const __m128i *)chunk), zero_vector)) & valid;
+        if (terminators != 0) {
+            break;
+        }
+        chunk += 16;
+        valid = 0xffffU;
+    }
+
+    /* Matches after the terminator belong to the next string. */
+    unsigned int limit = (unsigned int)__builtin_ctz(terminators);
+
+    for (;;) {
+        unsigned int matches = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_load_si128((const __m128i *)chunk), target_vector)) & valid & ((2U << limit) - 1U);
+
+        if (matches != 0) {
+            return (char *)(chunk + (31 - __builtin_clz(matches)));
+        }
+        if (chunk == first) {
+            return NULL;
+        }
+        chunk -= 16;
+        valid = chunk == first ? first_valid : 0xffffU;
+        limit = 15U;
+    }
+}
+
+#if defined(IRIS_HAVE_AVX2)
+/* Strings ending within the first 64 bytes: two unaligned vectors each for the terminator and the target. */
+__attribute__((aligned(64), target("avx2")))
+static char *strrchr_avx2_window(const char *string, unsigned char target)
+{
+    if (((uintptr_t)string & 4095U) > 4096U - 64U) {
+        return strrchr_aligned(string, target);
+    }
+    const __m256i zero_vector = _mm256_setzero_si256();
+    const __m256i target_vector = _mm256_set1_epi8((char)target);
+    __m256i low = _mm256_loadu_si256((const __m256i *)string);
+    __m256i high = _mm256_loadu_si256((const __m256i *)(string + 32));
+    uint64_t terminators = ((uint64_t)(unsigned int)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(low, zero_vector))) |
+        ((uint64_t)(unsigned int)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(high, zero_vector))) << 32;
+
+    if (terminators == 0) {
+        return strrchr_aligned(string, target);
+    }
+    /* Matches after the terminator belong to the next string. */
+    uint64_t keep = (2ULL << __builtin_ctzll(terminators)) - 1U;
+    uint64_t matches = (((uint64_t)(unsigned int)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(low, target_vector))) |
+        ((uint64_t)(unsigned int)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(high, target_vector))) << 32) & keep;
+
+    return matches != 0 ? (char *)(string + 63 - __builtin_clzll(matches)) : NULL;
+}
+#endif
+
+__attribute__((aligned(64)))
+char *strrchr(const char *string, int character)
+{
+    unsigned char target = (unsigned char)character;
+
+#if defined(IRIS_HAVE_AVX2)
+    if (cpu_has_avx2()) {
+        return strrchr_avx2_window(string, target);
+    }
+#endif
+    return strrchr_aligned(string, target);
+}
+
+void *memchr(const void *memory, int character, size_t count)
+{
+    const unsigned char *bytes = (const unsigned char *)memory;
+    unsigned char target = (unsigned char)character;
+
+    /* Two overlapping vectors cover any count from 16 to 32 without a loop. */
+    if (count >= 16 && count <= 32) {
+        const __m128i target_vector = _mm_set1_epi8((char)target);
+        unsigned int head = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i *)bytes), target_vector));
+        unsigned int tail = (unsigned int)_mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i *)(bytes + count - 16)), target_vector));
+        unsigned int mask = head | (tail << (count - 16));
+
+        return mask != 0 ? (void *)(bytes + __builtin_ctz(mask)) : NULL;
+    }
+#if defined(IRIS_HAVE_AVX2)
+    if (count >= 64 && cpu_has_avx2()) {
+        return memchr_avx2(bytes, target, count);
+    }
+#endif
+    return memchr_sse2(bytes, target, count);
 }
 
 __attribute__((noinline))
@@ -1636,8 +1898,26 @@ static int strcmp_generic(const unsigned char *left_bytes, const unsigned char *
     return compare_strings_sse2(left_bytes, right_bytes, SIZE_MAX, 0);
 }
 
+__attribute__((aligned(64)))
 int strcmp(const char *left, const char *right)
 {
+    const unsigned char *left_bytes = (const unsigned char *)left;
+    const unsigned char *right_bytes = (const unsigned char *)right;
+
+    /* Short strings: two SSE2 compares settle them before the wider path. */
+    if ((((uintptr_t)left_bytes & 4095U) <= 4096U - 32U) &
+            (((uintptr_t)right_bytes & 4095U) <= 4096U - 32U)) {
+        unsigned int stop_mask = string_chunk_stop_mask(
+            _mm_loadu_si128((const __m128i *)left_bytes),
+            _mm_loadu_si128((const __m128i *)right_bytes)) |
+            (string_chunk_stop_mask(_mm_loadu_si128((const __m128i *)(left_bytes + 16)),
+            _mm_loadu_si128((const __m128i *)(right_bytes + 16))) << 16);
+
+        if (stop_mask != 0) {
+            size_t index = (size_t)__builtin_ctz(stop_mask);
+            return (int)left_bytes[index] - (int)right_bytes[index];
+        }
+    }
 #if defined(IRIS_HAVE_AVX2)
     if (__builtin_expect(cpu_avx512_known(), 1)) {
         return compare_strings_avx512((const unsigned char *)left,
@@ -1690,11 +1970,32 @@ static int strncmp_generic(const char *left, const char *right, size_t count)
         count, 1);
 }
 
+__attribute__((aligned(64)))
 int strncmp(const char *left, const char *right, size_t count)
 {
     const unsigned char *left_bytes = (const unsigned char *)left;
     const unsigned char *right_bytes = (const unsigned char *)right;
 
+    /* One compare covers counts up to 16 without touching the second vector. */
+    if (count <= 16 && (((uintptr_t)left_bytes & 4095U) <= 4096U - 16U) &
+            (((uintptr_t)right_bytes & 4095U) <= 4096U - 16U)) {
+        __m128i left_chunk = _mm_loadu_si128((const __m128i *)left_bytes);
+        __m128i right_chunk = _mm_loadu_si128((const __m128i *)right_bytes);
+        unsigned int limit = ((1U << count) - 1U) & 0xffffU;
+        unsigned int mismatch = ~(unsigned int)_mm_movemask_epi8(
+            _mm_cmpeq_epi8(left_chunk, right_chunk)) & limit;
+
+        if (mismatch == 0) {
+            return 0;
+        }
+        size_t index = (size_t)__builtin_ctz(mismatch);
+        /* Equal bytes before a mismatch are either all content or end both strings. */
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(left_chunk, _mm_setzero_si128())) &
+                ((1U << index) - 1U)) {
+            return 0;
+        }
+        return (int)left_bytes[index] - (int)right_bytes[index];
+    }
     /* Small bounds: two SSE2 compares beat entering the wider vector path. */
     if (count <= 32 && (((uintptr_t)left_bytes & 4095U) <= 4096U - 32U) &
             (((uintptr_t)right_bytes & 4095U) <= 4096U - 32U)) {

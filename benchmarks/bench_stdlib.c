@@ -19,6 +19,7 @@
 #define QSORT_ITERATIONS 200U
 #define GETLINE_ITERATIONS 1000U
 #define TERMINATION_ITERATIONS 24U
+#define SYSTEM_QUERY_ITERATIONS 32U
 
 extern void *iris_malloc(size_t size);
 extern void *iris_calloc(size_t count, size_t size);
@@ -27,12 +28,17 @@ extern void iris_free(void *pointer);
 extern int iris_abs(int value);
 extern long iris_labs(long value);
 extern int iris_atoi(const char *string);
+extern char *iris_getenv(const char *name);
+extern int iris_system(const char *command);
+extern double iris_strtod(const char *restrict string,
+    char **restrict end_pointer);
 extern long iris_strtol(const char *restrict string, char **restrict end_pointer, int base);
 extern unsigned long iris_strtoul(const char *restrict string,
     char **restrict end_pointer, int base);
 extern void iris_qsort(void *base, size_t count, size_t size,
     int (*compare)(const void *, const void *));
 extern char *iris_setlocale(int category, const char *locale);
+extern struct lconv *iris_localeconv(void);
 extern int iris_isalnum(int character);
 extern int iris_isalpha(int character);
 extern int iris_isblank(int character);
@@ -477,6 +483,113 @@ static double time_iris_strtoul(size_t iterations)
     return time_strtoul(iterations, iris_strtoul);
 }
 
+static double time_strtod(size_t iterations,
+    double (*function)(const char *restrict, char **restrict))
+{
+    static const char *samples[] = { "-12.5", "0x1.8p+2", ".125e2", "1e-3" };
+    struct timespec start;
+    struct timespec end;
+    double sum = 0.0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        char *end_pointer = NULL;
+        sum += function(samples[index & 3U], &end_pointer);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)(sum * 1000.0);
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_strtod(size_t iterations)
+{
+    return time_strtod(iterations, strtod);
+}
+
+static double time_iris_strtod(size_t iterations)
+{
+    return time_strtod(iterations, iris_strtod);
+}
+
+static double time_getenv(size_t iterations, char *(*function)(const char *))
+{
+    struct timespec start;
+    struct timespec end;
+    size_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        const char *name = (index & 1U) == 0 ? "PATH" : "HOME";
+        char *value = function(name);
+        result += value != NULL ? strlen(value) : 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_getenv(size_t iterations)
+{
+    return time_getenv(iterations, getenv);
+}
+
+static double time_iris_getenv(size_t iterations)
+{
+    return time_getenv(iterations, iris_getenv);
+}
+
+static double time_system_query(size_t iterations, int (*function)(const char *))
+{
+    struct timespec start;
+    struct timespec end;
+    int result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        result += function(NULL);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += (size_t)result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_system_query(size_t iterations)
+{
+    return time_system_query(iterations, system);
+}
+
+static double time_iris_system_query(size_t iterations)
+{
+    return time_system_query(iterations, iris_system);
+}
+
+static double time_localeconv(size_t iterations, struct lconv *(*function)(void))
+{
+    struct timespec start;
+    struct timespec end;
+    size_t result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t index = 0; index < iterations; index++) {
+        struct lconv *conventions = function();
+        result += conventions != NULL && conventions->decimal_point != NULL
+            ? (unsigned char)conventions->decimal_point[0] : 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    benchmark_sink += result;
+    return elapsed_nanoseconds(start, end) / (double)iterations;
+}
+
+static double time_host_localeconv(size_t iterations)
+{
+    return time_localeconv(iterations, localeconv);
+}
+
+static double time_iris_localeconv(size_t iterations)
+{
+    return time_localeconv(iterations, iris_localeconv);
+}
+
 static double time_setlocale(size_t iterations,
     char *(*function)(int, const char *))
 {
@@ -780,8 +893,17 @@ int main(void)
     report_benchmark("atoi", STDLIB_ITERATIONS, time_host_atoi, time_iris_atoi);
     report_benchmark("strtoul", STDLIB_ITERATIONS,
         time_host_strtoul, time_iris_strtoul);
+    report_benchmark("strtod", STDLIB_ITERATIONS,
+        time_host_strtod, time_iris_strtod);
+    report_benchmark("getenv", STDLIB_ITERATIONS,
+        time_host_getenv, time_iris_getenv);
     report_benchmark("setlocale", STDLIB_ITERATIONS,
         time_host_setlocale, time_iris_setlocale);
+    report_benchmark("localeconv", STDLIB_ITERATIONS,
+        time_host_localeconv, time_iris_localeconv);
+    puts("system(NULL) capability query; host and Iris shell availability may differ");
+    report_benchmark("system(NULL)", SYSTEM_QUERY_ITERATIONS,
+        time_host_system_query, time_iris_system_query);
 
     int saved_stderr = dup(STDERR_FILENO);
     int null_descriptor = open("/dev/null", O_WRONLY);

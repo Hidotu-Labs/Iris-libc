@@ -7,7 +7,7 @@ BENCH_CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -fno-builtin
 
 LIBRARY = libc.a
 CRT0 = build/crt0.o
-OBJECTS = build/memory.o build/string.o build/string_x86_64.o build/string_extra.o build/unistd.o build/termios.o build/mman.o build/stdlib.o build/stdio.o build/stdio_extra.o build/ctype.o build/locale.o
+OBJECTS = build/memory.o build/string.o build/string_x86_64.o build/string_extra.o build/unistd.o build/termios.o build/mman.o build/stdlib.o build/stdio.o build/stdio_extra.o build/ctype.o build/locale.o build/time.o
 TEST = build/test_string
 BENCH = build/bench_string
 MUSL_BENCH = build/bench_string_musl
@@ -22,8 +22,8 @@ FILE_COPY = build/file_copy
 LINE_SORT = build/line_sort
 KILO_SOURCE ?= examples/kilo.c
 KILO = build/kilo_iris
-BENCH_OBJECTS = build/iris_memory_bench.o build/iris_string_bench.o build/iris_string_x86_64_bench.o build/iris_string_extra_bench.o build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_stdlib_bench.o build/iris_stdio_bench.o
-MUSL_BENCH_OBJECTS = build/iris_memory_musl_bench.o build/iris_string_musl_bench.o build/iris_string_x86_64_musl_bench.o build/iris_string_extra_musl_bench.o build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_stdlib_musl_bench.o build/iris_stdio_musl_bench.o
+BENCH_OBJECTS = build/iris_memory_bench.o build/iris_string_bench.o build/iris_string_x86_64_bench.o build/iris_string_extra_bench.o build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_stdlib_bench.o build/iris_stdio_bench.o build/iris_locale_bench.o
+MUSL_BENCH_OBJECTS = build/iris_memory_musl_bench.o build/iris_string_musl_bench.o build/iris_string_x86_64_musl_bench.o build/iris_string_extra_musl_bench.o build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_stdlib_musl_bench.o build/iris_stdio_musl_bench.o build/iris_locale_musl_bench.o
 
 .PHONY: all test benchmark benchmark-musl hello examples file-copy kilo clean
 
@@ -52,7 +52,7 @@ build/string_extra.o: src/string_extra.c include/string.h include/errno.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
 
-build/unistd.o: src/unistd.c include/unistd.h include/fcntl.h include/errno.h
+build/unistd.o: src/unistd.c include/unistd.h include/fcntl.h include/errno.h include/string.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
 
@@ -64,7 +64,7 @@ build/mman.o: src/mman.c include/sys/mman.h include/errno.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
 
-build/stdlib.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h
+build/stdlib.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h include/locale.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
 
@@ -84,11 +84,15 @@ build/locale.o: src/locale.c include/locale.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
 
+build/time.o: src/time.c include/time.h include/errno.h
+	mkdir -p build
+	$(CC) $(CFLAGS) -Iinclude -Isrc -c $< -o $@
+
 $(TEST): tests/test_string.c src/memory.c src/string.c src/string_x86_64.c src/string_extra.c src/unistd.c src/mman.c src/stdlib.c src/stdio.c src/stdio_extra.c include/string.h include/unistd.h include/stdio.h include/fcntl.h include/sys/mman.h include/stdlib.h include/errno.h
 	mkdir -p build
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -fno-builtin -Iinclude -Isrc tests/test_string.c src/memory.c src/string.c src/string_x86_64.c src/string_extra.c src/unistd.c src/mman.c src/stdlib.c src/stdio.c src/stdio_extra.c -o $@
 
-build/test_stdlib: tests/test_stdlib.c $(CRT0) $(LIBRARY) include/stdlib.h include/stdio.h include/string.h include/ctype.h include/locale.h include/errno.h
+build/test_stdlib: tests/test_stdlib.c $(CRT0) $(LIBRARY) include/stdlib.h include/stdio.h include/string.h include/ctype.h include/locale.h include/time.h include/errno.h include/signal.h
 	mkdir -p build
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -nostdlib -static -fno-builtin -Iinclude $< $(CRT0) $(LIBRARY) -o $@
 
@@ -138,20 +142,28 @@ build/iris_string_bench.o: src/string.c include/string.h
 build/iris_string_extra_bench.o: src/string_extra.c include/string.h include/errno.h
 	mkdir -p build
 	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
-		-Dstrchr=iris_strchr -Dstrstr=iris_strstr -Dstrerror=iris_strerror \
+		-Dmemchr=iris_memchr -Dstrchr=iris_strchr -Dstrrchr=iris_strrchr \
+		-Dstrcpy=iris_strcpy -Dstrncpy=iris_strncpy -Dstrcat=iris_strcat \
+		-Dstrncat=iris_strncat -Dstrpbrk=iris_strpbrk -Dstrspn=iris_strspn \
+		-Dstrcspn=iris_strcspn -Dstrcoll=iris_strcoll \
+		-Dstrstr=iris_strstr -Dstrerror=iris_strerror \
 		-c $< -o $@
 
 build/iris_string_extra_musl_bench.o: src/string_extra.c include/string.h include/errno.h
 	mkdir -p build
 	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
-		-Dstrchr=iris_strchr -Dstrstr=iris_strstr -Dstrerror=iris_strerror \
+		-Dmemchr=iris_memchr -Dstrchr=iris_strchr -Dstrrchr=iris_strrchr \
+		-Dstrcpy=iris_strcpy -Dstrncpy=iris_strncpy -Dstrcat=iris_strcat \
+		-Dstrncat=iris_strncat -Dstrpbrk=iris_strpbrk -Dstrspn=iris_strspn \
+		-Dstrcspn=iris_strcspn -Dstrcoll=iris_strcoll \
+		-Dstrstr=iris_strstr -Dstrerror=iris_strerror \
 		-c $< -o $@
 
 build/iris_string_x86_64_bench.o: src/string_x86_64.c include/string.h
 	mkdir -p build
 	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dmemcpy=iris_memcpy -Dmemmove=iris_memmove \
-		-Dmemset=iris_memset -Dmemcmp=iris_memcmp \
+		-Dmemset=iris_memset -Dmemcmp=iris_memcmp -Dmemchr=iris_memchr -Dstrrchr=iris_strrchr \
 		-Dstrlen=iris_strlen -Dstrcmp=iris_strcmp -Dstrncmp=iris_strncmp \
 		-c $< -o $@
 
@@ -159,6 +171,8 @@ build/iris_unistd_bench.o: src/unistd.c include/unistd.h include/fcntl.h include
 	mkdir -p build
 	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dread=iris_read -Dwrite=iris_write -Dclose=iris_close \
+		-Dunlink=iris_unlink -Drmdir=iris_rmdir -Dmkstemp=iris_mkstemp \
+		-Drename=iris_rename \
 		-Dopen=iris_open -Dlseek=iris_lseek -Dftruncate=iris_ftruncate \
 		-Dioctl=iris_ioctl -Dtime=iris_time -Dsignal=iris_signal \
 		-Dgetpid=iris_getpid \
@@ -177,12 +191,14 @@ build/iris_mman_bench.o: src/mman.c include/sys/mman.h include/errno.h
 		-Dmmap=iris_mmap -Dmunmap=iris_munmap -Dmprotect=iris_mprotect \
 		-c $< -o $@
 
-build/iris_stdlib_bench.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h
+build/iris_stdlib_bench.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h include/locale.h
 	mkdir -p build
 	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dmalloc=iris_malloc -Dcalloc=iris_calloc -Drealloc=iris_realloc \
 		-Dfree=iris_free -Datexit=iris_atexit -Dexit=iris_exit -D_Exit=iris__Exit -Dabort=iris_abort \
 		-Dabs=iris_abs -Dlabs=iris_labs -Datoi=iris_atoi \
+		-Dgetenv=iris_getenv -Dsystem=iris_system -Dstrtod=iris_strtod \
+		-Dlocaleconv=iris_localeconv \
 		-Dstrtol=iris_strtol -Dstrtoul=iris_strtoul -Dqsort=iris_qsort \
 		-Dmmap=iris_mmap -Dmunmap=iris_munmap -D_exit=iris__exit \
 		-Dfflush=iris_fflush -Dmemset=iris_memset -Dmemcpy=iris_memcpy \
@@ -208,12 +224,14 @@ build/iris_ctype_musl_bench.o: src/ctype.c include/ctype.h
 
 build/iris_locale_bench.o: src/locale.c include/locale.h
 	mkdir -p build
-	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc -Dsetlocale=iris_setlocale \
+	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
+		-Dsetlocale=iris_setlocale -Dlocaleconv=iris_localeconv \
 		-c $< -o $@
 
 build/iris_locale_musl_bench.o: src/locale.c include/locale.h
 	mkdir -p build
-	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc -Dsetlocale=iris_setlocale \
+	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
+		-Dsetlocale=iris_setlocale -Dlocaleconv=iris_localeconv \
 		-c $< -o $@
 
 build/iris_stdio_bench.o: src/stdio.c include/stdio.h include/unistd.h include/fcntl.h include/string.h include/errno.h
@@ -222,10 +240,15 @@ build/iris_stdio_bench.o: src/stdio.c include/stdio.h include/unistd.h include/f
 		-Dprintf=iris_printf -Dvprintf=iris_vprintf \
 		-Dfprintf=iris_fprintf -Dvfprintf=iris_vfprintf \
 		-Dsnprintf=iris_snprintf -Dvsnprintf=iris_vsnprintf \
-		-Dfopen=iris_fopen -Dfclose=iris_fclose -Dfflush=iris_fflush \
+		-Dsprintf=iris_sprintf -Dvsprintf=iris_vsprintf \
+		-Dfopen=iris_fopen -Dfreopen=iris_freopen -Dtmpfile=iris_tmpfile \
+		-Dtmpnam=iris_tmpnam -Dsetvbuf=iris_setvbuf -Dremove=iris_remove \
+		-Dmkstemp=iris_mkstemp -Dunlink=iris_unlink -Drmdir=iris_rmdir \
+		-Dfclose=iris_fclose -Dfflush=iris_fflush \
 		-Dfseek=iris_fseek -Dftell=iris_ftell -Drewind=iris_rewind \
 		-Dfgets=iris_fgets -Dfputs=iris_fputs -Dputs=iris_puts \
 		-Dfread=iris_fread -Dfwrite=iris_fwrite -Dfgetc=iris_fgetc \
+		-Dgetc=iris_getc -Dungetc=iris_ungetc \
 		-Dfputc=iris_fputc -Dfeof=iris_feof -Dferror=iris_ferror \
 		-Dclearerr=iris_clearerr -Dstdin=iris_stdin -Dstdout=iris_stdout \
 		-Dstderr=iris_stderr -Dopen=iris_open -Dclose=iris_close \
@@ -268,7 +291,7 @@ build/iris_string_x86_64_musl_bench.o: src/string_x86_64.c include/string.h
 	mkdir -p build
 	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dmemcpy=iris_memcpy -Dmemmove=iris_memmove \
-		-Dmemset=iris_memset -Dmemcmp=iris_memcmp \
+		-Dmemset=iris_memset -Dmemcmp=iris_memcmp -Dmemchr=iris_memchr -Dstrrchr=iris_strrchr \
 		-Dstrlen=iris_strlen -Dstrcmp=iris_strcmp -Dstrncmp=iris_strncmp \
 		-c $< -o $@
 
@@ -276,10 +299,30 @@ build/iris_unistd_musl_bench.o: src/unistd.c include/unistd.h include/fcntl.h in
 	mkdir -p build
 	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dread=iris_read -Dwrite=iris_write -Dclose=iris_close \
+		-Dunlink=iris_unlink -Drmdir=iris_rmdir -Dmkstemp=iris_mkstemp \
+		-Drename=iris_rename \
 		-Dopen=iris_open -Dlseek=iris_lseek -Dftruncate=iris_ftruncate \
 		-Dioctl=iris_ioctl -Dtime=iris_time -Dsignal=iris_signal \
 		-Dgetpid=iris_getpid \
 		-D_exit=iris__exit \
+		-c $< -o $@
+
+build/iris_time_bench.o: src/time.c include/time.h include/errno.h
+	mkdir -p build
+	$(HOST_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
+		-Dclock=iris_clock -Ddifftime=iris_difftime \
+		-Dgmtime=iris_gmtime -Dlocaltime=iris_localtime \
+		-Dgmtime_r=iris_gmtime_r -Dlocaltime_r=iris_localtime_r \
+		-Dmktime=iris_mktime -Dstrftime=iris_strftime \
+		-c $< -o $@
+
+build/iris_time_musl_bench.o: src/time.c include/time.h include/errno.h
+	mkdir -p build
+	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
+		-Dclock=iris_clock -Ddifftime=iris_difftime \
+		-Dgmtime=iris_gmtime -Dlocaltime=iris_localtime \
+		-Dgmtime_r=iris_gmtime_r -Dlocaltime_r=iris_localtime_r \
+		-Dmktime=iris_mktime -Dstrftime=iris_strftime \
 		-c $< -o $@
 
 build/iris_termios_musl_bench.o: src/termios.c include/termios.h include/sys/ioctl.h include/unistd.h include/errno.h
@@ -294,12 +337,14 @@ build/iris_mman_musl_bench.o: src/mman.c include/sys/mman.h include/errno.h
 		-Dmmap=iris_mmap -Dmunmap=iris_munmap -Dmprotect=iris_mprotect \
 		-c $< -o $@
 
-build/iris_stdlib_musl_bench.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h
+build/iris_stdlib_musl_bench.o: src/stdlib.c include/stdlib.h include/stdio.h include/string.h include/sys/mman.h include/unistd.h include/errno.h include/locale.h
 	mkdir -p build
 	$(MUSL_CC) $(BENCH_CFLAGS) -Iinclude -Isrc \
 		-Dmalloc=iris_malloc -Dcalloc=iris_calloc -Drealloc=iris_realloc \
 		-Dfree=iris_free -Datexit=iris_atexit -Dexit=iris_exit -D_Exit=iris__Exit -Dabort=iris_abort \
 		-Dabs=iris_abs -Dlabs=iris_labs -Datoi=iris_atoi \
+		-Dgetenv=iris_getenv -Dsystem=iris_system -Dstrtod=iris_strtod \
+		-Dlocaleconv=iris_localeconv \
 		-Dstrtol=iris_strtol -Dstrtoul=iris_strtoul -Dqsort=iris_qsort \
 		-Dmmap=iris_mmap -Dmunmap=iris_munmap -D_exit=iris__exit \
 		-Dfflush=iris_fflush -Dmemset=iris_memset -Dmemcpy=iris_memcpy \
@@ -311,10 +356,15 @@ build/iris_stdio_musl_bench.o: src/stdio.c include/stdio.h include/unistd.h incl
 		-Dprintf=iris_printf -Dvprintf=iris_vprintf \
 		-Dfprintf=iris_fprintf -Dvfprintf=iris_vfprintf \
 		-Dsnprintf=iris_snprintf -Dvsnprintf=iris_vsnprintf \
-		-Dfopen=iris_fopen -Dfclose=iris_fclose -Dfflush=iris_fflush \
+		-Dsprintf=iris_sprintf -Dvsprintf=iris_vsprintf \
+		-Dfopen=iris_fopen -Dfreopen=iris_freopen -Dtmpfile=iris_tmpfile \
+		-Dtmpnam=iris_tmpnam -Dsetvbuf=iris_setvbuf -Dremove=iris_remove \
+		-Dmkstemp=iris_mkstemp -Dunlink=iris_unlink -Drmdir=iris_rmdir \
+		-Dfclose=iris_fclose -Dfflush=iris_fflush \
 		-Dfseek=iris_fseek -Dftell=iris_ftell -Drewind=iris_rewind \
 		-Dfgets=iris_fgets -Dfputs=iris_fputs -Dputs=iris_puts \
 		-Dfread=iris_fread -Dfwrite=iris_fwrite -Dfgetc=iris_fgetc \
+		-Dgetc=iris_getc -Dungetc=iris_ungetc \
 		-Dfputc=iris_fputc -Dfeof=iris_feof -Dferror=iris_ferror \
 		-Dclearerr=iris_clearerr -Dstdin=iris_stdin -Dstdout=iris_stdout \
 		-Dstderr=iris_stderr -Dopen=iris_open -Dclose=iris_close \
@@ -327,8 +377,8 @@ $(BENCH): benchmarks/bench_string.c $(BENCH_OBJECTS)
 $(STDIO_BENCH): benchmarks/bench_stdio.c build/iris_stdio_bench.o build/iris_unistd_bench.o
 	$(HOST_CC) $(BENCH_CFLAGS) $^ -o $@
 
-$(UNISTD_BENCH): benchmarks/bench_unistd.c benchmarks/bench_common.h build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_termios_bench.o
-	$(HOST_CC) $(BENCH_CFLAGS) $< build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_termios_bench.o -o $@
+$(UNISTD_BENCH): benchmarks/bench_unistd.c benchmarks/bench_common.h build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_termios_bench.o build/iris_time_bench.o
+	$(HOST_CC) $(BENCH_CFLAGS) $< build/iris_unistd_bench.o build/iris_mman_bench.o build/iris_termios_bench.o build/iris_time_bench.o -o $@
 
 $(STDLIB_BENCH): benchmarks/bench_stdlib.c benchmarks/bench_common.h build/iris_stdlib_bench.o build/iris_stdio_extra_bench.o build/iris_string_extra_bench.o build/iris_ctype_bench.o build/iris_locale_bench.o build/iris_mman_bench.o build/iris_unistd_bench.o build/iris_stdio_bench.o build/iris_memory_bench.o build/iris_string_x86_64_bench.o
 	$(HOST_CC) $(BENCH_CFLAGS) $< build/iris_stdlib_bench.o build/iris_stdio_extra_bench.o build/iris_string_extra_bench.o build/iris_ctype_bench.o build/iris_locale_bench.o build/iris_mman_bench.o build/iris_unistd_bench.o build/iris_stdio_bench.o build/iris_memory_bench.o build/iris_string_x86_64_bench.o -o $@
@@ -339,8 +389,8 @@ $(MUSL_BENCH): benchmarks/bench_string.c $(MUSL_BENCH_OBJECTS)
 $(STDIO_MUSL_BENCH): benchmarks/bench_stdio.c build/iris_stdio_musl_bench.o build/iris_unistd_musl_bench.o
 	$(MUSL_CC) $(BENCH_CFLAGS) -DBENCH_LIBC_NAME='"musl"' $^ -o $@
 
-$(UNISTD_MUSL_BENCH): benchmarks/bench_unistd.c benchmarks/bench_common.h build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_termios_musl_bench.o
-	$(MUSL_CC) $(BENCH_CFLAGS) -DBENCH_LIBC_NAME='"musl"' $< build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_termios_musl_bench.o -o $@
+$(UNISTD_MUSL_BENCH): benchmarks/bench_unistd.c benchmarks/bench_common.h build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_termios_musl_bench.o build/iris_time_musl_bench.o
+	$(MUSL_CC) $(BENCH_CFLAGS) -DBENCH_LIBC_NAME='"musl"' $< build/iris_unistd_musl_bench.o build/iris_mman_musl_bench.o build/iris_termios_musl_bench.o build/iris_time_musl_bench.o -o $@
 
 $(STDLIB_MUSL_BENCH): benchmarks/bench_stdlib.c benchmarks/bench_common.h build/iris_stdlib_musl_bench.o build/iris_stdio_extra_musl_bench.o build/iris_string_extra_musl_bench.o build/iris_ctype_musl_bench.o build/iris_locale_musl_bench.o build/iris_mman_musl_bench.o build/iris_unistd_musl_bench.o build/iris_stdio_musl_bench.o build/iris_memory_musl_bench.o build/iris_string_x86_64_musl_bench.o
 	$(MUSL_CC) $(BENCH_CFLAGS) -DBENCH_LIBC_NAME='"musl"' $< build/iris_stdlib_musl_bench.o build/iris_stdio_extra_musl_bench.o build/iris_string_extra_musl_bench.o build/iris_ctype_musl_bench.o build/iris_locale_musl_bench.o build/iris_mman_musl_bench.o build/iris_unistd_musl_bench.o build/iris_stdio_musl_bench.o build/iris_memory_musl_bench.o build/iris_string_x86_64_musl_bench.o -o $@
